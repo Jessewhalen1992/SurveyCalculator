@@ -1,7 +1,7 @@
-// SurveyCalculator - ALS workflow commands for AutoCAD Map 3D (.NET 4.8)
+// SurveyCalculator - ALS workflow commands for AutoCAD Map 3D (.NET 8)
 // Commands: PLANLINK, PLANEXTRACT, EVILINK, ALSADJ
 // Build x64; refs: acdbmgd.dll, acmgd.dll, ManagedMapApi.dll (Copy Local = false)
-// Framework refs used: System.Windows.Forms, System.Web.Extensions (JSON)
+// Framework refs used: System.Windows.Forms
 
 using System;
 using System.Collections.Generic;
@@ -9,11 +9,12 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Web.Script.Serialization;
+using System.Text.Json;
 using System.Windows.Forms;
 
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.Colors;
+using AcadApp = Autodesk.AutoCAD.ApplicationServices.Application;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
@@ -42,13 +43,13 @@ namespace SurveyCalculator
 
         public static string CurrentDwgFolder()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = AcadApp.DocumentManager.MdiActiveDocument;
             string n = string.IsNullOrEmpty(doc?.Name) ? "" : doc.Name;
             return string.IsNullOrEmpty(n) ? Environment.GetFolderPath(Environment.SpecialFolder.Desktop) : Path.GetDirectoryName(n);
         }
         public static string Stem()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = AcadApp.DocumentManager.MdiActiveDocument;
             string n = string.IsNullOrEmpty(doc?.Name) ? "Drawing" : Path.GetFileNameWithoutExtension(doc.Name);
             return string.IsNullOrEmpty(n) ? "Drawing" : n;
         }
@@ -59,14 +60,20 @@ namespace SurveyCalculator
 
     internal static class Json
     {
-        static readonly JavaScriptSerializer Ser = new JavaScriptSerializer() { MaxJsonLength = int.MaxValue };
-        public static void Save<T>(string path, T obj) => File.WriteAllText(path, Ser.Serialize(obj), Encoding.UTF8);
-        public static T Load<T>(string path) => new JavaScriptSerializer().Deserialize<T>(File.ReadAllText(path, Encoding.UTF8));
+        static readonly JsonSerializerOptions Opt = new JsonSerializerOptions
+        {
+            WriteIndented = false,
+            PropertyNamingPolicy = null
+        };
+        public static void Save<T>(string path, T obj)
+            => File.WriteAllText(path, JsonSerializer.Serialize(obj, Opt), Encoding.UTF8);
+        public static T Load<T>(string path)
+            => JsonSerializer.Deserialize<T>(File.ReadAllText(path, Encoding.UTF8), Opt);
     }
 
     internal static class Cad
     {
-        public static Editor Ed => Application.DocumentManager.MdiActiveDocument.Editor;
+        public static Editor Ed => AcadApp.DocumentManager.MdiActiveDocument.Editor;
         public static Database Db => HostApplicationServices.WorkingDatabase;
 
         public static ObjectId EnsureLayer(string name, short aci = 7, bool lockAfter = false)
@@ -246,16 +253,16 @@ namespace SurveyCalculator
                 double dx = e.Distance * Math.Cos(e.BearingRad);
                 double dy = e.Distance * Math.Sin(e.BearingRad);
                 deltas.Add(new Vector2d(dx, dy)); sumL += e.Distance;
-                raw.Add(new Point2d(raw[^1].X + dx, raw[^1].Y + dy));
+                raw.Add(new Point2d(raw[raw.Count - 1].X + dx, raw[raw.Count - 1].Y + dy));
             }
-            double Cx = endHeld.X - raw[^1].X; double Cy = endHeld.Y - raw[^1].Y;
+            double Cx = endHeld.X - raw[raw.Count - 1].X; double Cy = endHeld.Y - raw[raw.Count - 1].Y;
             closure = Math.Sqrt(Cx * Cx + Cy * Cy);
             var closed = new List<Point2d> { startHeld };
             for (int i = 0; i < deltas.Count; i++)
             {
                 double f = chain[i].Distance / sumL;
                 var adj = new Vector2d(deltas[i].X + f * Cx, deltas[i].Y + f * Cy);
-                closed.Add(new Point2d(closed[^1].X + adj.X, closed[^1].Y + adj.Y));
+                closed.Add(new Point2d(closed[closed.Count - 1].X + adj.X, closed[closed.Count - 1].Y + adj.Y));
             }
             return closed;
         }
@@ -493,7 +500,7 @@ namespace SurveyCalculator
             }
 
             var frm = new EvilinkForm(links);
-            var res = Application.ShowModalDialog(frm);
+            var res = AcadApp.ShowModalDialog(frm);
             if (res == DialogResult.OK)
             {
                 var path = Config.EvidenceJsonPath();
