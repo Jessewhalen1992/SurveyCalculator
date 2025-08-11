@@ -63,10 +63,13 @@ namespace SurveyCalculator
         static readonly JsonSerializerOptions Opt = new JsonSerializerOptions
         {
             WriteIndented = false,
-            PropertyNamingPolicy = null
+            PropertyNamingPolicy = null,
+            IncludeFields = true   // <-- add this
         };
+
         public static void Save<T>(string path, T obj)
             => File.WriteAllText(path, JsonSerializer.Serialize(obj, Opt), Encoding.UTF8);
+
         public static T Load<T>(string path)
             => JsonSerializer.Deserialize<T>(File.ReadAllText(path, Encoding.UTF8), Opt);
     }
@@ -75,6 +78,24 @@ namespace SurveyCalculator
     {
         public static Editor Ed => AcadApp.DocumentManager.MdiActiveDocument.Editor;
         public static Database Db => HostApplicationServices.WorkingDatabase;
+        public static bool UnlockIfLocked(string layerName)
+        {
+            bool wasLocked = false;
+            using var tr = Db.TransactionManager.StartTransaction();
+            var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
+            if (lt.Has(layerName))
+            {
+                var rec = (LayerTableRecord)tr.GetObject(lt[layerName], OpenMode.ForRead);
+                if (rec.IsLocked)
+                {
+                    rec.UpgradeOpen();
+                    rec.IsLocked = false;
+                    wasLocked = true;
+                }
+            }
+            tr.Commit();
+            return wasLocked;
+        }
 
         public static ObjectId EnsureLayer(string name, short aci = 7, bool lockAfter = false)
         {
@@ -129,7 +150,15 @@ namespace SurveyCalculator
                 ? Ed.GetSelection(opts, new SelectionFilter(filter))
                 : Ed.GetSelection(opts);
         }
-        public static PromptPointResult GetPoint(string msg) => Ed.GetPoint("\n" + msg + ": ");
+        // Replace the old 1‑arg GetPoint with this:
+        public static PromptPointResult GetPoint(string msg, bool allowNone = false)
+        {
+            var opts = new PromptPointOptions("\n" + msg + ": ")
+            {
+                AllowNone = allowNone
+            };
+            return Ed.GetPoint(opts);
+        }
         public static double Distance(Point2d a, Point2d b) { var dx = a.X - b.X; var dy = a.Y - b.Y; return Math.Sqrt(dx * dx + dy * dy); }
         public static double ToAzimuthRad(Point2d a, Point2d b)
         {
@@ -142,7 +171,7 @@ namespace SurveyCalculator
             double theta = north ? (east ? az : Math.PI - az) : (east ? 2 * Math.PI - az : az - Math.PI);
             double deg = theta * 180.0 / Math.PI; int d = (int)Math.Floor(deg + 1e-9);
             double remM = (deg - d) * 60.0; int m = (int)Math.Floor(remM + 1e-9); double s = (remM - m) * 60.0;
-            return $"{(north ? "N" : "S")} {d:00}°{m:00}'{s:00.##}" {(east ? "E" : "W")}";
+            return $"{(north ? "N" : "S")} {d:00}°{m:00}'{s:00.##}\" {(east ? "E" : "W")}";
         }
     }
 
@@ -167,12 +196,14 @@ namespace SurveyCalculator
     [Serializable]
     public class EvidencePoint
     {
-        public string PlanId = "";      // e.g., "P7"
-        public string Handle = "";      // drawing handle
-        public double X; public double Y;
-        public string EvidenceType = ""; // block name
-        public bool Held = false;
-        public int Priority = 0;        // reserved
+        public string PlanId { get; set; } = "";     // e.g., "P7"
+        public string Handle { get; set; } = "";     // drawing handle
+        public double X { get; set; }
+        public double Y { get; set; }
+        public string EvidenceType { get; set; } = "";  // block name
+        public bool Held { get; set; } = false;
+        public int Priority { get; set; } = 0;          // reserved
+
         public Point2d XY() => new Point2d(X, Y);
     }
 
@@ -269,40 +300,74 @@ namespace SurveyCalculator
     }
 
     // ---------------------------- EVILINK Form ----------------------------
+    // ---------------------------- EVILINK Form ----------------------------
     public class EvilinkForm : Form
     {
         public EvidenceLinks Links { get; private set; }
-        DataGridView grid = new DataGridView();
-        Button btnSave = new Button();
-        Button btnCancel = new Button();
-        Label lbl = new Label();
+
+        private readonly DataGridView grid = new DataGridView();
+        private readonly Button btnSave = new Button();
+        private readonly Button btnCancel = new Button();
+        private readonly Label lbl = new Label();
 
         public EvilinkForm(EvidenceLinks links)
         {
-            Text = "Evidence ↔ Plan Linker (EVILINK)";
-            Width = 820; Height = 520; StartPosition = FormStartPosition.CenterScreen;
-            Links = links;
+            this.Text = "Evidence ↔ Plan Linker (EVILINK)";
+            this.Width = 820;
+            this.Height = 520;
+            this.StartPosition = FormStartPosition.CenterScreen;
 
-            grid.Dock = DockStyle.Top; grid.Height = 400; grid.AutoGenerateColumns = false;
-            grid.AllowUserToAddRows = false; grid.AllowUserToDeleteRows = false; grid.DataSource = Links.Points;
+            Links = links ?? new EvidenceLinks();
 
+            grid.Dock = DockStyle.Top;
+            grid.Height = 400;
+            grid.AutoGenerateColumns = false;
+            grid.AllowUserToAddRows = false;
+            grid.AllowUserToDeleteRows = false;
+            grid.DataSource = Links.Points;
+
+            // Columns
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Handle", DataPropertyName = "Handle", ReadOnly = true, Width = 120 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "X", DataPropertyName = "X", ReadOnly = true, Width = 120 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Y", DataPropertyName = "Y", ReadOnly = true, Width = 120 });
+
+            var colX = new DataGridViewTextBoxColumn { HeaderText = "X", DataPropertyName = "X", ReadOnly = true, Width = 120 };
+            colX.DefaultCellStyle.Format = "0.###";
+            colX.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+            grid.Columns.Add(colX);
+
+            var colY = new DataGridViewTextBoxColumn { HeaderText = "Y", DataPropertyName = "Y", ReadOnly = true, Width = 120 };
+            colY.DefaultCellStyle.Format = "0.###";
+            colY.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+            grid.Columns.Add(colY);
+
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "PlanID (P#)", DataPropertyName = "PlanId", Width = 100 });
             grid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "Held", DataPropertyName = "Held", Width = 60 });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "EvidenceType (block)", DataPropertyName = "EvidenceType", ReadOnly = true, Width = 180 });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Priority", DataPropertyName = "Priority", Width = 60 });
 
-            btnSave.Text = "Save"; btnSave.Width = 100; btnSave.Top = 430; btnSave.Left = 600;
-            btnSave.Click += (s, e) => { DialogResult = DialogResult.OK; Close(); };
-            btnCancel.Text = "Cancel"; btnCancel.Width = 100; btnCancel.Top = 430; btnCancel.Left = 710;
-            btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+            // Buttons
+            btnSave.Text = "Save";
+            btnSave.Width = 100;
+            btnSave.Top = 430;
+            btnSave.Left = 600;
+            btnSave.Click += (s, e) => { this.DialogResult = DialogResult.OK; this.Close(); };
 
+            btnCancel.Text = "Cancel";
+            btnCancel.Width = 100;
+            btnCancel.Top = 430;
+            btnCancel.Left = 710;
+            btnCancel.Click += (s, e) => { this.DialogResult = DialogResult.Cancel; this.Close(); };
+
+            // Tip label
             lbl.Text = "Tip: Auto PlanID from nearest plan vertex. FDI auto‑Held, fdspike not held by default.";
-            lbl.Top = 405; lbl.Left = 10; lbl.Width = 560;
+            lbl.Top = 405;
+            lbl.Left = 10;
+            lbl.Width = 560;
 
-            Controls.Add(grid); Controls.Add(btnSave); Controls.Add(btnCancel); Controls.Add(lbl);
+            // Compose
+            this.Controls.Add(grid);
+            this.Controls.Add(btnSave);
+            this.Controls.Add(btnCancel);
+            this.Controls.Add(lbl);
         }
     }
 
@@ -316,38 +381,64 @@ namespace SurveyCalculator
             var ed = Cad.Ed;
             ed.WriteMessage("\nPLANLINK — align imported plan entities to field control (similarity fit).");
 
+            // 1) Select plan entities (usually from PDFIMPORT)
             var psr = Cad.PromptSelect("Select imported plan entities (from PDFIMPORT)");
             if (psr.Status != PromptStatus.OK) return;
             var ids = psr.Value.GetObjectIds();
             if (ids == null || ids.Length == 0) { ed.WriteMessage("\nNothing selected."); return; }
 
+            // 2) Ensure target layer exists; temporarily unlock if locked
             Cad.EnsureLayer(Config.LayerPdf, aci: 4);
-            Cad.SetLayer(ids, Config.LayerPdf);
+            bool wasLocked = Cad.UnlockIfLocked(Config.LayerPdf);
 
-            var pairs = new List<(Point2d from, Point2d to, double w)>();
-            for (int i = 1; i <= 5; i++)
+            try
             {
-                var p1 = Cad.GetPoint($"Pick SOURCE point ON PLAN (pair {i}, Enter to finish)");
-                if (p1.Status != PromptStatus.OK)
-                { if (pairs.Count >= 2) break; ed.WriteMessage("\nNeed at least 2 pairs."); return; }
-                var p2 = Cad.GetPoint($"Pick MATCHING FIELD point (target for pair {i})");
-                if (p2.Status != PromptStatus.OK) { ed.WriteMessage("\nCancelled."); return; }
-                pairs.Add((new Point2d(p1.Value.X, p1.Value.Y), new Point2d(p2.Value.X, p2.Value.Y), 1.0));
+                // Put the selection on the PDF layer (requires it not be locked)
+                Cad.SetLayer(ids, Config.LayerPdf);
+
+                // 3) Collect 2–5 control pairs; Enter finishes early
+                var pairs = new List<(Point2d from, Point2d to, double w)>();
+                for (int i = 1; i <= 5; i++)
+                {
+                    var p1 = Cad.GetPoint($"Pick SOURCE point ON PLAN (pair {i}, Enter to finish)", allowNone: true);
+                    if (p1.Status != PromptStatus.OK)
+                    {
+                        if (pairs.Count >= 2) break;     // finish if we already have 2+
+                        ed.WriteMessage("\nNeed at least 2 pairs.");
+                        return;
+                    }
+                    var p2 = Cad.GetPoint($"Pick MATCHING FIELD point (target for pair {i})");
+                    if (p2.Status != PromptStatus.OK) { ed.WriteMessage("\nCancelled."); return; }
+
+                    pairs.Add((new Point2d(p1.Value.X, p1.Value.Y),
+                               new Point2d(p2.Value.X, p2.Value.Y),
+                               1.0));
+                }
+
+                // 4) Solve free‑scale to detect unit mismatch/benefit
+                if (!SimilarityFit.Solve(pairs, false, out double kf, out double cf, out double sf, out Vector2d tf))
+                {
+                    ed.WriteMessage("\nCould not solve similarity transform (check control pairs).");
+                    return;
+                }
+
+                // 5) ALSGuard decides whether to apply scale or lock to 1.0
+                var (k, c, s, t, usedScale) = DecideScalingALS(pairs, kf, cf, sf, tf, ed);
+
+                // 6) Transform the selected entities
+                var m = SimilarityFit.ToMatrix(k, c, s, t);
+                Cad.TransformEntities(ids, m);
+
+                ed.WriteMessage(usedScale
+                    ? $"\nPLANLINK done (scale applied). k={k:0.000000}, rot={Math.Atan2(s, c) * 180 / Math.PI:0.000}°, t=({t.X:0.###},{t.Y:0.###})."
+                    : $"\nPLANLINK done (scale locked to 1.0). rot={Math.Atan2(s, c) * 180 / Math.PI:0.000}°, t=({t.X:0.###},{t.Y:0.###}).");
             }
-
-            // Free-scale to detect unit mismatch and potential improvement
-            if (!SimilarityFit.Solve(pairs, false, out double kf, out double cf, out double sf, out Vector2d tf))
-            { ed.WriteMessage("\nCould not solve similarity transform (check control pairs)."); return; }
-
-            // Decide with ALSGuard
-            var (k, c, s, t, usedScale) = DecideScalingALS(pairs, kf, cf, sf, tf, ed);
-            var m = SimilarityFit.ToMatrix(k, c, s, t);
-            Cad.TransformEntities(ids, m);
-
-            Cad.LockLayer(Config.LayerPdf, true);
-            ed.WriteMessage(usedScale
-                ? $"\nPLANLINK done (scale applied). k={k:0.000000}, rot={Math.Atan2(s,c)*180/Math.PI:0.000}°, t=({t.X:0.###},{t.Y:0.###}). Layer {Config.LayerPdf} locked."
-                : $"\nPLANLINK done (scale locked to 1.0). rot={Math.Atan2(s,c)*180/Math.PI:0.000}°, t=({t.X:0.###},{t.Y:0.###}). Layer {Config.LayerPdf} locked.");
+            finally
+            {
+                // 7) Keep plan entities protected afterwards
+                Cad.LockLayer(Config.LayerPdf, true);
+                ed.WriteMessage($" Layer {Config.LayerPdf} locked.");
+            }
         }
 
         private static double ComputeRms(IReadOnlyList<(Point2d from, Point2d to, double w)> pairs,
