@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- Change to your actual install path if needed -->
+    <ACAD_DIR>C:\Program Files\Autodesk\AutoCAD Map 3D 2025</ACAD_DIR>
+  </PropertyGroup>
+</Project>
