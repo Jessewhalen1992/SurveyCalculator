@@ -10,6 +10,7 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using System.Globalization;
 using System.Windows.Forms;
 
 using Autodesk.AutoCAD.ApplicationServices;
@@ -188,6 +189,7 @@ namespace SurveyCalculator
         public List<XY> VertexXY = new List<XY>();           // actual polyline XY for nearest-vertex mapping
         public List<PlanEdge> Edges = new List<PlanEdge>();  // distances + bearings (geometry or plan numbers)
         public bool Closed = true;
+        public double CombinedScaleFactor = 1.0; // optional CSF: multiply ground distances to grid if desired
         public int Count => VertexIds.Count;
         public int IndexOf(string id) => VertexIds.FindIndex(v => string.Equals(v, id, StringComparison.OrdinalIgnoreCase));
         public PlanEdge EdgeAt(int i) => Edges[i];
@@ -210,22 +212,96 @@ namespace SurveyCalculator
     [Serializable] public class EvidenceLinks { public List<EvidencePoint> Points = new List<EvidencePoint>(); }
 
     // ---------------------------- Parsing ----------------------------
-    internal static class BearingParser
+    internal static class BearingParserEx
     {
-        static readonly Regex Dms = new Regex(@"([NS])\s*(\d{1,3})°\s*(\d{1,2})?['’]?\s*(\d{1,2}(\.\d+)?)?[""”]?\s*([EW])",
-                                              RegexOptions.Compiled | RegexOptions.IgnoreCase);
-        public static bool TryParse(string text, out double az)
+        // Quadrant bearing: N dd°mm'ss.s" E     (spacing/symbols flexible: D or °; ' or ’; " or ”)
+        static readonly Regex Quad = new Regex(
+            @"^\s*([NS])\s*([0-9]{1,3})\s*(?:[D°])\s*([0-9]{1,2})?\s*['’]?\s*([0-9]{1,2}(?:\.\d+)?)?\s*[""”]?\s*([EW])\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        // Azimuth from north, clockwise:  [AZ] dd°mm'ss.s"     (e.g., 45D04'30")
+        static readonly Regex AzDms = new Regex(
+            @"^\s*(?:AZ\s*)?([0-9]{1,3})\s*(?:[D°])\s*([0-9]{1,2})?\s*['’]?\s*([0-9]{1,2}(?:\.\d+)?)?\s*[""”]?\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        // Azimuth from north, clockwise: decimal degrees (e.g., 123.5 or AZ 123.5°)
+        static readonly Regex AzDec = new Regex(
+            @"^\s*(?:AZ\s*)?([0-9]+(?:\.[0-9]+)?)\s*(?:[D°])?\s*$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        public static bool TryParseToAzimuthRad(string text, out double azEastRad)
         {
-            az = 0; if (string.IsNullOrWhiteSpace(text)) return false;
-            text = text.Replace('’', '\'').Replace('″', '"');
-            var m = Dms.Match(text); if (!m.Success) return false;
-            int d = int.Parse(m.Groups[2].Value);
-            int min = string.IsNullOrEmpty(m.Groups[3].Value) ? 0 : int.Parse(m.Groups[3].Value);
-            double sec = 0; if (!string.IsNullOrEmpty(m.Groups[4].Value)) double.TryParse(m.Groups[4].Value, out sec);
-            double ang = (d + min / 60.0 + sec / 3600.0) * Math.PI / 180.0;
-            bool north = char.ToUpper(m.Groups[1].Value[0]) == 'N'; bool east = char.ToUpper(m.Groups[6].Value[0]) == 'E';
-            az = north ? (east ? ang : Math.PI - ang) : (east ? 2 * Math.PI - ang : ang - Math.PI);
-            return true;
+            azEastRad = 0;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            text = text.Trim().Replace('’', '\'').Replace('″', '"');
+
+            // 1) Quadrant: N/S ... E/W
+            var mq = Quad.Match(text);
+            if (mq.Success)
+            {
+                bool north = char.ToUpperInvariant(mq.Groups[1].Value[0]) == 'N';
+                bool east  = char.ToUpperInvariant(mq.Groups[5].Value[0]) == 'E';
+                int d = int.Parse(mq.Groups[2].Value, CultureInfo.InvariantCulture);
+                int m = string.IsNullOrEmpty(mq.Groups[3].Value) ? 0 : int.Parse(mq.Groups[3].Value, CultureInfo.InvariantCulture);
+                double s = string.IsNullOrEmpty(mq.Groups[4].Value) ? 0 : double.Parse(mq.Groups[4].Value, CultureInfo.InvariantCulture);
+
+                double theta = (d + m/60.0 + s/3600.0) * Math.PI / 180.0; // away from N/S toward E/W
+
+                // Convert quadrant -> azimuth-from-north (clockwise)
+                double azN = 0;
+                if (north && east)  azN = theta;                 // NE
+                if (north && !east) azN = 2*Math.PI - theta;     // NW
+                if (!north && east) azN = Math.PI - theta;       // SE
+                if (!north && !east)azN = Math.PI + theta;       // SW
+
+                // Our math frame: 0 along +X (east), CCW
+                azEastRad = (Math.PI/2) - azN;
+                while (azEastRad < 0) azEastRad += 2*Math.PI;
+                while (azEastRad >= 2*Math.PI) azEastRad -= 2*Math.PI;
+                return true;
+            }
+
+            // 2) Azimuth-from-north (clockwise): DMS
+            var md = AzDms.Match(text);
+            if (md.Success)
+            {
+                int d = int.Parse(md.Groups[1].Value, CultureInfo.InvariantCulture);
+                int m = string.IsNullOrEmpty(md.Groups[2].Value) ? 0 : int.Parse(md.Groups[2].Value, CultureInfo.InvariantCulture);
+                double s = string.IsNullOrEmpty(md.Groups[3].Value) ? 0 : double.Parse(md.Groups[3].Value, CultureInfo.InvariantCulture);
+                double deg = d + m/60.0 + s/3600.0;
+                double azN = deg * Math.PI / 180.0;
+
+                azEastRad = (Math.PI/2) - azN;
+                while (azEastRad < 0) azEastRad += 2*Math.PI;
+                while (azEastRad >= 2*Math.PI) azEastRad -= 2*Math.PI;
+                return true;
+            }
+
+            // 3) Azimuth-from-north (clockwise): decimal degrees
+            var mz = AzDec.Match(text);
+            if (mz.Success)
+            {
+                double deg = double.Parse(mz.Groups[1].Value, CultureInfo.InvariantCulture);
+                double azN = deg * Math.PI / 180.0;
+
+                azEastRad = (Math.PI/2) - azN;
+                while (azEastRad < 0) azEastRad += 2*Math.PI;
+                while (azEastRad >= 2*Math.PI) azEastRad -= 2*Math.PI;
+                return true;
+            }
+            return false;
+        }
+
+        // Convenience: parse one-line "bearing distance" like:  N45°04'30"E 550.50  OR  45D04'30" 550.50  OR with a comma
+        static readonly Regex BearingDistLine = new Regex(@"^\s*(?<b>.+?)\s*(?:,|\s)\s*(?<d>[+-]?\d+(?:\.\d+)?)\s*$", RegexOptions.Compiled);
+        public static bool TryParseBearingAndDistance(string line, out double azEast, out double dist)
+        {
+            azEast = 0; dist = 0;
+            if (string.IsNullOrWhiteSpace(line)) return false;
+            var m = BearingDistLine.Match(line);
+            if (!m.Success) return false;
+            if (!TryParseToAzimuthRad(m.Groups["b"].Value, out azEast)) return false;
+            return double.TryParse(m.Groups["d"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out dist);
         }
     }
 
@@ -358,7 +434,7 @@ namespace SurveyCalculator
             btnCancel.Click += (s, e) => { this.DialogResult = DialogResult.Cancel; this.Close(); };
 
             // Tip label
-            lbl.Text = "Tip: Auto PlanID from nearest plan vertex. FDI auto‑Held, fdspike not held by default.";
+            lbl.Text = "Tip: If you used PLANCOGO, PlanIDs won’t auto-snap until you assign them; FDI auto‑Held, fdspike not held by default.";
             lbl.Top = 405;
             lbl.Left = 10;
             lbl.Width = 560;
@@ -489,12 +565,185 @@ namespace SurveyCalculator
             return (1, cl, sl, tl, false);
         }
 
+        [CommandMethod("PLANCOGO")]
+        public void PlanCogo()
+        {
+            var ed = Cad.Ed;
+            ed.WriteMessage("\nPLANCOGO — build plan graph from numeric bearings/distances (grid azimuths).");
+
+            // Choose mode: Manual or CSV
+            var mode = new PromptKeywordOptions("\nMode [Manual/CSV] <Manual>: ");
+            mode.Keywords.Add("Manual"); mode.Keywords.Add("CSV"); mode.AllowNone = true;
+            var km = ed.GetKeywords(mode);
+            bool useCsv = (km.Status == PromptStatus.OK && km.StringResult == "CSV");
+
+            var plan = new PlanData { Closed = true, CombinedScaleFactor = 1.0 };
+
+            double csf = 1.0;
+
+            if (useCsv)
+            {
+                using var dlg = new OpenFileDialog { Title = "Select COGO CSV", Filter = "CSV files (*.csv)|*.csv|All files|*.*", Multiselect = false };
+                if (dlg.ShowDialog() != DialogResult.OK) { ed.WriteMessage("\nCancelled."); return; }
+
+                string[] lines = File.ReadAllLines(dlg.FileName);
+                if (lines.Length == 0) { ed.WriteMessage("\nCSV is empty."); return; }
+
+                // Optional header tokens, e.g. "# CSF=0.999419"
+                foreach (var raw in lines.Take(10))
+                {
+                    var t = raw.Trim();
+                    if (!t.StartsWith("#", StringComparison.Ordinal)) continue;
+                    var kv = t.TrimStart('#').Trim();
+                    var parts = kv.Split('=', 2, StringSplitOptions.TrimEntries);
+                    if (parts.Length == 2 && parts[0].Equals("CSF", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && v > 0.5 && v < 1.5) csf = v;
+                    }
+                }
+                plan.CombinedScaleFactor = csf;
+
+                // Ask whether to apply CSF if not 1.0
+                bool applyCsf = true;
+                if (Math.Abs(csf - 1.0) > 1e-6)
+                {
+                    var k = new PromptKeywordOptions($"\nCSV header CSF={csf:0.######}. Apply to distances? [Yes/No] <Yes>: ");
+                    k.Keywords.Add("Yes"); k.Keywords.Add("No"); k.AllowNone = true;
+                    var kr = ed.GetKeywords(k);
+                    applyCsf = !(kr.Status == PromptStatus.OK && kr.StringResult == "No");
+                }
+
+                var cur = new Point2d(0, 0);
+                int autoIdx = 1;
+
+                foreach (var raw in lines)
+                {
+                    var line = raw.Trim();
+                    if (line.Length == 0 || line.StartsWith("#")) continue;
+
+                    // Supports either:
+                    //   FromId,ToId,Bearing,Distance
+                    //   Bearing,Distance
+                    var parts = line.Split(',').Select(s => s.Trim()).ToArray();
+
+                    string fromId = "", toId = "", btxt = "", dtxt = "";
+
+                    if (parts.Length == 4)
+                    {
+                        fromId = parts[0]; toId = parts[1]; btxt = parts[2]; dtxt = parts[3];
+                    }
+                    else if (parts.Length == 2)
+                    {
+                        fromId = $"P{autoIdx}"; toId = $"P{autoIdx + 1}"; btxt = parts[0]; dtxt = parts[1];
+                    }
+                    else
+                    {
+                        ed.WriteMessage($"\nSkip row (need 2 or 4 columns): {line}");
+                        continue;
+                    }
+
+                    if (!BearingParserEx.TryParseToAzimuthRad(btxt, out double az))
+                    { ed.WriteMessage($"\nInvalid bearing: {btxt}"); return; }
+
+                    if (!double.TryParse(dtxt, NumberStyles.Float, CultureInfo.InvariantCulture, out double dist) || dist <= 0)
+                    { ed.WriteMessage($"\nInvalid distance: {dtxt}"); return; }
+
+                    double dUse = applyCsf ? dist * csf : dist;
+
+                    if (plan.VertexIds.Count == 0)
+                    {
+                        plan.VertexIds.Add(fromId);
+                        plan.VertexXY.Add(new XY(cur.X, cur.Y));
+                    }
+
+                    // Add edge + advance
+                    cur = new Point2d(cur.X + dUse * Math.Cos(az), cur.Y + dUse * Math.Sin(az));
+                    plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = az });
+                    plan.VertexIds.Add(toId);
+                    plan.VertexXY.Add(new XY(cur.X, cur.Y));
+
+                    autoIdx++;
+                }
+            }
+            else
+            {
+                // Manual mode — optional CSF prompt
+                var s = ed.GetString(new PromptStringOptions("\nCombined Scale Factor to apply to distances (Enter for 1.0): ") { AllowSpaces = false });
+                if (s.Status == PromptStatus.OK && double.TryParse(s.StringResult, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && v > 0.5 && v < 1.5)
+                    csf = v;
+                plan.CombinedScaleFactor = csf;
+
+                var cur = new Point2d(0, 0);
+                int leg = 1;
+
+                plan.VertexIds.Add("P1");
+                plan.VertexXY.Add(new XY(cur.X, cur.Y));
+
+                while (true)
+                {
+                    var ps = new PromptStringOptions($"\nLeg {leg} — enter \"bearing distance\" (e.g., N45°04'30\"E 550.50  or  45D04'30\" 550.50). Enter to finish.")
+                    { AllowSpaces = true };
+                    var pr = ed.GetString(ps);
+
+                    if (pr.Status != PromptStatus.OK || string.IsNullOrWhiteSpace(pr.StringResult))
+                    {
+                        if (plan.Edges.Count >= 2) break;
+                        ed.WriteMessage("\nNeed at least 2 legs."); return;
+                    }
+
+                    double az, dist;
+                    if (!BearingParserEx.TryParseBearingAndDistance(pr.StringResult, out az, out dist))
+                    {
+                        // fallback: ask separately
+                        string btxt = pr.StringResult.Trim();
+                        if (!BearingParserEx.TryParseToAzimuthRad(btxt, out az)) { ed.WriteMessage("\nCould not parse bearing."); return; }
+                        var dd = ed.GetDouble(new PromptDoubleOptions($"Distance for leg {leg} (m): ") { AllowNegative = false, AllowZero = false });
+                        if (dd.Status != PromptStatus.OK) return;
+                        dist = dd.Value;
+                    }
+
+                    double dUse = dist * csf;
+
+                    string fromId = $"P{leg}";
+                    string toId   = $"P{leg + 1}";
+
+                    cur = new Point2d(cur.X + dUse * Math.Cos(az), cur.Y + dUse * Math.Sin(az));
+                    plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = az });
+                    plan.VertexIds.Add(toId);
+                    plan.VertexXY.Add(new XY(cur.X, cur.Y));
+
+                    leg++;
+                }
+
+                // Closed? (default Yes)
+                var kopt = new PromptKeywordOptions("\nClose the figure? [Yes/No] <Yes>: ");
+                kopt.Keywords.Add("Yes"); kopt.Keywords.Add("No"); kopt.AllowNone = true;
+                var kr = ed.GetKeywords(kopt);
+                plan.Closed = !(kr.Status == PromptStatus.OK && kr.StringResult == "No");
+            }
+
+            // Save JSON + quick note
+            var path = Config.PlanJsonPath();
+            Json.Save(path, plan);
+            ed.WriteMessage($"\nWrote plan to: {path}");
+
+            var sb = new StringBuilder();
+            sb.AppendLine("\\LPlan (COGO) Summary\\l");
+            sb.AppendLine($"Vertices: {plan.Count}");
+            sb.AppendLine($"Perimeter (numeric): {plan.Edges.Sum(e => e.Distance):0.###} m");
+            sb.AppendLine($"CSF applied: {plan.CombinedScaleFactor:0.######}");
+            var mt = new MText { Contents = sb.ToString(), Location = new Point3d(0,0,0), TextHeight = 2.5 };
+            Cad.AddToModelSpace(mt);
+
+            ed.WriteMessage("\nNext step: EVILINK → assign Held evidence (P#) → ALSADJ.");
+        }
+
         // -------- PLANEXTRACT --------
         [CommandMethod("PLANEXTRACT")]
         public void PlanExtract()
         {
             var ed = Cad.Ed;
-            ed.WriteMessage("\nPLANEXTRACT — select the plan boundary polyline on layer X_PDF_PLAN.");
+            ed.WriteMessage("\nPLANEXTRACT (legacy) — PDF linework extraction. Prefer PLANCOGO to build from bearings/distances.");
 
             var peo = new PromptEntityOptions("\nSelect plan boundary polyline: ");
             peo.SetRejectMessage("\nOnly Polyline entities are supported.");
