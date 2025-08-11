@@ -12,6 +12,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
+  <!-- Autodesk managed assemblies -->
   <ItemGroup>
     <Reference Include="acdbmgd">
       <HintPath>$(ACAD_DIR)\acdbmgd.dll</HintPath>
@@ -26,18 +27,14 @@
       <HintPath>$(ACAD_DIR)\AcCoreMgd.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <!-- Map vertical (present under \Map) -->
+    <!-- Map vertical lives under the \Map subfolder -->
     <Reference Include="ManagedMapApi" Condition="Exists('$(ACAD_DIR)\Map\ManagedMapApi.dll')">
       <HintPath>$(ACAD_DIR)\Map\ManagedMapApi.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
 
-  <ItemGroup>
-    <Reference Include="System.Windows.Forms" />
-    <Reference Include="System.Drawing" />
-  </ItemGroup>
-
+  <!-- Copy the built DLL to /deploy for easy NETLOAD -->
   <Target Name="PostBuild" AfterTargets="Build">
     <MakeDir Directories="$(MSBuildProjectDirectory)\..\..\deploy" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(MSBuildProjectDirectory)\..\..\deploy" />
