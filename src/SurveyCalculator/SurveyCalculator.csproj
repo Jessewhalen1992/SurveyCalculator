@@ -26,6 +26,12 @@
     </Reference>
   </ItemGroup>
 
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Web.Extensions" />
+    <Reference Include="System.Drawing" />
+  </ItemGroup>
+
   <Target Name="PostBuild" AfterTargets="Build">
     <MakeDir Directories="$(MSBuildProjectDirectory)\..\..\deploy" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(MSBuildProjectDirectory)\..\..\deploy" />
