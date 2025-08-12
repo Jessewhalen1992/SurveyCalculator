@@ -27,14 +27,14 @@ In AutoCAD Map 3D: NETLOAD → pick deploy\SurveyCalculator.dll
 Use the commands below to perform the ALS workflow.
 
 ## Commands
-- PLANLINK: Align imported plan entities to field control (similarity fit). Locks X_PDF_PLAN layer.
-- PLANEXTRACT: Extract ordered P1…Pn from the plan boundary polyline; writes {DWG}_PlanGraph.json.
+- PLANCOGO: Build plan graph from numeric bearings/distances (manual entry or CSV); draws plan polyline and writes {DWG}_PlanGraph.json.
 - EVILINK: Link evidence blocks → PlanID + Held/Floating (FDI auto‑Held, fdspike weaker); writes {DWG}_EvidenceLinks.json.
 - ALSADJ: ALS‑style adjust; Held anchors fixed; traverse between anchors by plan numbers with compass closure; draws adjusted boundary + residuals; writes {DWG}_AdjustmentReport.csv.
+- PLANLINK / PLANEXTRACT: Legacy commands kept for PDFIMPORT workflows.
 
 ## Usage (quick)
-1) Import plan with PDFIMPORT (vector).
-2) PLANLINK → pick 2–5 control pairs; ALSGuard will prompt if scale is appropriate.
-3) PLANEXTRACT → select the plan boundary polyline on X_PDF_PLAN.
-4) EVILINK → window-select your evidence blocks; review auto PlanID/Held settings and Save.
-5) ALSADJ → produces adjusted boundary on BOUNDARY_ADJ, residuals on QA_RESIDUALS, and CSV in your DWG folder.
+1) PLANCOGO → enter bearings/distances manually or load a CSV to create the plan boundary and {DWG}_PlanGraph.json.
+2) EVILINK → window-select your evidence blocks; assign PlanIDs and Held/Floating; Save to {DWG}_EvidenceLinks.json.
+3) ALSADJ → produces adjusted boundary on BOUNDARY_ADJ, residuals on QA_RESIDUALS, and CSV in your DWG folder.
+
+Legacy PDFIMPORT + PLANLINK + PLANEXTRACT workflow is still available but not preferred.
