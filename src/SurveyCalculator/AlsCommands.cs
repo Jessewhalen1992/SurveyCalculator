@@ -390,7 +390,7 @@ namespace SurveyCalculator
         }
     }
 
-    internal enum SolveTag { Held, BearingDistance, BearingIntersection, Proportion, CompassTraverse }
+    internal enum SolveTag { Held, BearingDistance, BearingIntersection, Proportion, CompassTraverse, SimilarityBetween }
 
     internal static class PlanBuild
     {
@@ -1108,6 +1108,13 @@ namespace SurveyCalculator
             var ed = Cad.Ed;
             ed.WriteMessage("\nALSADJ — hold anchors, re-drive between anchors by plan numbers with compass closure.");
 
+            var mopt = new PromptKeywordOptions("\nBetween held anchors use [Similarity/Compass] <Similarity>: ");
+            mopt.Keywords.Add("Similarity");
+            mopt.Keywords.Add("Compass");
+            mopt.AllowNone = true;
+            var mres = ed.GetKeywords(mopt);
+            bool useSimBetween = !(mres.Status == PromptStatus.OK && mres.StringResult == "Compass");
+
             string planPath = Config.PlanJsonPath();
             if (!File.Exists(planPath)) { ed.WriteMessage($"\nMissing: {planPath}. Run PLANEXTRACT."); return; }
             var plan = Json.Load<PlanData>(planPath);
@@ -1240,14 +1247,24 @@ namespace SurveyCalculator
                 var startXY = adj[start];
                 var endXY   = adj[end];
 
-                double closure;
-                var drove = TraverseSolver.DriveBetween(startXY, endXY, chain, Config.ClosureWarningMeters, out closure);
-                if (closure > Config.ClosureWarningMeters)
-                    Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
+                List<Point2d> drove;
+                double closure = 0;
+
+                if (useSimBetween)
+                {
+                    drove = TwoPointSimilarityBetween(startXY, endXY, chain);
+                }
+                else
+                {
+                    drove = TraverseSolver.DriveBetween(startXY, endXY, chain, Config.ClosureWarningMeters, out closure);
+                    if (closure > Config.ClosureWarningMeters)
+                        Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
+                }
 
                 int kidx = 0;
-                for (int j = start; j < end; j++) { adj[j] = drove[kidx++]; tag[j] = SolveTag.CompassTraverse; }
-                adj[end] = drove[kidx]; tag[end] = tag.ContainsKey(end) ? tag[end] : SolveTag.CompassTraverse;
+                var segTag = useSimBetween ? SolveTag.SimilarityBetween : SolveTag.CompassTraverse;
+                for (int j = start; j < end; j++) { adj[j] = drove[kidx++]; tag[j] = segTag; }
+                adj[end] = drove[kidx]; tag[end] = tag.ContainsKey(end) ? tag[end] : segTag;
             }
 
             // 2) If the plan is CLOSED, also do the wrap segment (last held → first held)
@@ -1267,14 +1284,24 @@ namespace SurveyCalculator
                 var startXY = adj[start];
                 var endXY   = adj[end];
 
-                double closure;
-                var drove = TraverseSolver.DriveBetween(startXY, endXY, chain, Config.ClosureWarningMeters, out closure);
-                if (closure > Config.ClosureWarningMeters)
-                    Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
+                List<Point2d> drove;
+                double closure = 0;
+
+                if (useSimBetween)
+                {
+                    drove = TwoPointSimilarityBetween(startXY, endXY, chain);
+                }
+                else
+                {
+                    drove = TraverseSolver.DriveBetween(startXY, endXY, chain, Config.ClosureWarningMeters, out closure);
+                    if (closure > Config.ClosureWarningMeters)
+                        Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
+                }
 
                 int kidx = 0; i = start;
-                while (i != end) { adj[i] = drove[kidx++]; tag[i] = SolveTag.CompassTraverse; i = (i + 1) % n; }
-                adj[end] = drove[kidx]; tag[end] = tag.ContainsKey(end) ? tag[end] : SolveTag.CompassTraverse;
+                var segTag = useSimBetween ? SolveTag.SimilarityBetween : SolveTag.CompassTraverse;
+                while (i != end) { adj[i] = drove[kidx++]; tag[i] = segTag; i = (i + 1) % n; }
+                adj[end] = drove[kidx]; tag[end] = tag.ContainsKey(end) ? tag[end] : segTag;
             }
 
             // 3) OPEN tails: propagate one-way from nearest held (no closure); mark as BearingDistance
@@ -1350,7 +1377,35 @@ namespace SurveyCalculator
             }
             WriteCsvReport(plan, links, adj, k, Math.Atan2(s, c), methodById);
 
-            ed.WriteMessage($"\nALSADJ done. {(usedScale ? "Scale applied." : "Scale locked.")} Adjusted boundary on {Config.LayerAdjusted}. Residuals on {Config.LayerResiduals} ({residualCount}).\nCSV: {Config.ReportCsvPath()}");
+            ed.WriteMessage($"\nALSADJ done. {(usedScale ? \"Scale applied.\" : \"Scale locked.\")} Adjusted boundary on {Config.LayerAdjusted}. Residuals on {Config.LayerResiduals} ({residualCount}).\nCSV: {Config.ReportCsvPath()}");
+        }
+
+        private static List<Point2d> TwoPointSimilarityBetween(Point2d startHeld, Point2d endHeld,
+            IReadOnlyList<PlanEdge> chain)
+        {
+            // Raw forward from the start (no closure)
+            var raw = TraverseSolver.DriveOpenFrom(startHeld, chain);
+            var pEndRaw = raw[^1];
+
+            // Vector from startHeld to raw end, and to true end
+            var vRaw = new Vector2d(pEndRaw.X - startHeld.X, pEndRaw.Y - startHeld.Y);
+            var v    = new Vector2d(endHeld.X  - startHeld.X, endHeld.Y  - startHeld.Y);
+
+            // Similarity parameters: scale and rotation
+            double k = v.Length / Math.Max(1e-12, vRaw.Length);
+            double rot = Math.Atan2(v.Y, v.X) - Math.Atan2(vRaw.Y, vRaw.X);
+            double c = Math.Cos(rot), s = Math.Sin(rot);
+
+            // Map every raw point by k + rot about startHeld
+            var outPts = new List<Point2d>(raw.Count);
+            foreach (var p in raw)
+            {
+                double dx = p.X - startHeld.X, dy = p.Y - startHeld.Y;
+                double x = k * (c * dx - s * dy) + startHeld.X;
+                double y = k * (s * dx + c * dy) + startHeld.Y;
+                outPts.Add(new Point2d(x, y));
+            }
+            return outPts;
         }
 
         private static List<Point2d> TraverseWhole(PlanData plan)
