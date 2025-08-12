@@ -373,6 +373,21 @@ namespace SurveyCalculator
             }
             return closed;
         }
+
+        // Forward integrate a chain from a single held point (no closure).
+        public static List<Point2d> DriveOpenFrom(Point2d startHeld, IReadOnlyList<PlanEdge> chain)
+        {
+            var pts = new List<Point2d> { startHeld };
+            var p = startHeld;
+            foreach (var e in chain)
+            {
+                p = new Point2d(
+                    p.X + e.Distance * Math.Cos(e.BearingRad),
+                    p.Y + e.Distance * Math.Sin(e.BearingRad));
+                pts.Add(p);
+            }
+            return pts;
+        }
     }
 
     internal static class PlanBuild
@@ -1103,34 +1118,99 @@ namespace SurveyCalculator
             var adj = new Point2d[plan.Count];
             foreach (var h in held) if (idToIndex.TryGetValue(h.PlanId, out int idx)) adj[idx] = h.XY();
 
-            // Walk arcs between consecutive held vertices (wrap)
+            // Re-drive segments between held vertices (supports open chains)
             var heldIdx = held.Where(h => idToIndex.ContainsKey(h.PlanId))
                               .Select(h => idToIndex[h.PlanId])
-                              .Distinct().OrderBy(i => i).ToList();
-            if (!plan.Closed) { ed.WriteMessage("\nPlan not closed; expected closed loop."); return; }
+                              .Distinct()
+                              .OrderBy(i => i)
+                              .ToList();
 
-            for (int hIdx = 0; hIdx < heldIdx.Count; hIdx++)
+            int n = plan.Count;
+
+            // 1) Segments BETWEEN adjacent held anchors
+            for (int hIdx = 0; hIdx < heldIdx.Count - 1; hIdx++)
             {
                 int start = heldIdx[hIdx];
-                int end = heldIdx[(hIdx + 1) % heldIdx.Count];
+                int end   = heldIdx[hIdx + 1];
 
-                var chain = new List<PlanEdge>(); int i = start;
-                while (i != end) { chain.Add(plan.EdgeAt(i)); i = (i + 1) % plan.Count; }
+                var chain = new List<PlanEdge>();
+                for (int i = start; i < end; i++) chain.Add(plan.EdgeAt(i));
 
-                var startXY = adj[start]; var endXY = adj[end];
+                var startXY = adj[start];
+                var endXY   = adj[end];
+
                 double closure;
                 var drove = TraverseSolver.DriveBetween(startXY, endXY, chain, Config.ClosureWarningMeters, out closure);
                 if (closure > Config.ClosureWarningMeters)
                     Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
 
-                int kidx = 0; int j = start;
-                while (j != end) { adj[j] = drove[kidx]; kidx++; j = (j + 1) % plan.Count; }
+                int kidx = 0;
+                for (int j = start; j < end; j++) { adj[j] = drove[kidx++]; }
                 adj[end] = drove[kidx];
+            }
+
+            // 2) If the plan is CLOSED, also do the wrap segment (last held → first held)
+            if (plan.Closed && heldIdx.Count >= 2)
+            {
+                int start = heldIdx[^1];
+                int end   = heldIdx[0];
+
+                var chain = new List<PlanEdge>();
+                int i = start;
+                while (i != end)
+                {
+                    chain.Add(plan.EdgeAt(i));
+                    i = (i + 1) % n;
+                }
+
+                var startXY = adj[start];
+                var endXY   = adj[end];
+
+                double closure;
+                var drove = TraverseSolver.DriveBetween(startXY, endXY, chain, Config.ClosureWarningMeters, out closure);
+                if (closure > Config.ClosureWarningMeters)
+                    Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
+
+                int kidx = 0; i = start;
+                while (i != end) { adj[i] = drove[kidx++]; i = (i + 1) % n; }
+                adj[end] = drove[kidx];
+            }
+
+            // 3) OPEN tails: propagate one-way from nearest held (no closure)
+            if (!plan.Closed && heldIdx.Count >= 1)
+            {
+                int firstHeld = heldIdx[0];
+                int lastHeld  = heldIdx[^1];
+
+                // Left tail (… P0 ← ... ← P[firstHeld])
+                if (firstHeld > 0)
+                {
+                    var revChain = new List<PlanEdge>();
+                    // walk edges backward: i = firstHeld-1 down to 0, reverse bearing (+π)
+                    for (int i2 = firstHeld - 1; i2 >= 0; i2--)
+                    {
+                        var e = plan.EdgeAt(i2);
+                        revChain.Add(new PlanEdge { Distance = e.Distance, BearingRad = Normalize(e.BearingRad + Math.PI) });
+                    }
+                    var droveLeft = TraverseSolver.DriveOpenFrom(adj[firstHeld], revChain);
+                    // droveLeft[0] is held; [1] => P[firstHeld-1], ..., last => P0
+                    for (int k = 1; k < droveLeft.Count; k++) adj[firstHeld - k] = droveLeft[k];
+                }
+
+                // Right tail (P[lastHeld] → … → P[n-1])
+                if (lastHeld < n - 1)
+                {
+                    var fwdChain = new List<PlanEdge>();
+                    for (int i2 = lastHeld; i2 < n - 1; i2++) fwdChain.Add(plan.EdgeAt(i2));
+                    var droveRight = TraverseSolver.DriveOpenFrom(adj[lastHeld], fwdChain);
+                    // droveRight[0] is held; [1] => P[lastHeld+1], ..., last => P[n-1]
+                    for (int k = 1; k < droveRight.Count; k++) adj[lastHeld + k] = droveRight[k];
+                }
             }
 
             // Build adjusted polyline
             Cad.EnsureLayer(Config.LayerAdjusted, aci: 2);
-            var plAdj = new Polyline { Layer = Config.LayerAdjusted, Closed = true };
+            var plAdj = new Polyline { Layer = Config.LayerAdjusted, Closed = plan.Closed };
             for (int i = 0; i < plan.Count; i++) plAdj.AddVertexAt(i, adj[i], 0, 0, 0);
             Cad.AddToModelSpace(plAdj);
 
@@ -1169,6 +1249,13 @@ namespace SurveyCalculator
             }
             if (pts.Count != plan.Count) { pts = new List<Point2d>(plan.Count); for (int i = 0; i < plan.Count; i++) pts.Add(new Point2d(i, 0)); }
             return pts;
+        }
+
+        static double Normalize(double a)
+        {
+            while (a < 0) a += 2 * Math.PI;
+            while (a >= 2 * Math.PI) a -= 2 * Math.PI;
+            return a;
         }
 
         private static void DrawResidualArrow(Point2d fromEv, Point2d toAdj, double len)
