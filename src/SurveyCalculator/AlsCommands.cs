@@ -552,6 +552,239 @@ namespace SurveyCalculator
             var cleaned = Regex.Replace(raw, @"[^\d\.\-+]", "");
             return double.TryParse(cleaned, NumberStyles.Float, CultureInfo.InvariantCulture, out val);
         }
+        private static string WriteTextWithFallback(string primaryPath, string contents)
+        {
+            try
+            {
+                File.WriteAllText(primaryPath, contents, Encoding.UTF8);
+                return primaryPath;
+            }
+            catch (IOException ex)
+            {
+                var ed = Cad.Ed;
+                ed.WriteMessage($"\nReport file locked: {Path.GetFileName(primaryPath)} — {ex.Message}");
+
+                string dir = Path.GetDirectoryName(primaryPath) ?? Config.CurrentDwgFolder();
+                string name = Path.GetFileNameWithoutExtension(primaryPath);
+                string ext = Path.GetExtension(primaryPath);
+                string ts = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                string alt = Path.Combine(dir, $"{name}_{ts}{ext}");
+
+                // 1) Try timestamp fallback
+                try { File.WriteAllText(alt, contents, Encoding.UTF8); return alt; }
+                catch (IOException)
+                {
+                    // 2) Let the user pick a different filename
+                    using var sfd = new SaveFileDialog
+                    {
+                        Title = "Save Adjustment Report CSV",
+                        Filter = "CSV files (*.csv)|*.csv|All files|*.*",
+                        FileName = Path.GetFileName(primaryPath),
+                        InitialDirectory = dir
+                    };
+                    if (sfd.ShowDialog() == DialogResult.OK)
+                    {
+                        File.WriteAllText(sfd.FileName, contents, Encoding.UTF8);
+                        return sfd.FileName;
+                    }
+
+                    // 3) Last resort: temp folder
+                    string tmp = Path.Combine(Path.GetTempPath(), $"{name}_{ts}{ext}");
+                    File.WriteAllText(tmp, contents, Encoding.UTF8);
+                    ed.WriteMessage($"\nWrote report to temp: {tmp}");
+                    return tmp;
+                }
+            }
+        }
+        [CommandMethod("EVIHARVEST")]
+        public void EvidenceHarvest()
+        {
+            var ed = Cad.Ed;
+            ed.WriteMessage("\nEVIHARVEST — select evidence blocks, whitelist filter, auto-number, label, and save links.");
+
+            // --- Defaults (case-insensitive) ---
+            var defaultNames = new[]
+            {
+        "PLI","plhub","plspike","PLIBAR","FDI","TEMP","fdhub","FDIBAR","fdspike","WITF"
+    };
+            var allowed = new HashSet<string>(defaultNames, StringComparer.OrdinalIgnoreCase);
+
+            // Persisted whitelist (per drawing folder)
+            string wlPath = Path.Combine(Config.CurrentDwgFolder(), $"{Config.Stem()}_BlockWhitelist.json");
+            try
+            {
+                if (File.Exists(wlPath))
+                {
+                    var persisted = Json.Load<List<string>>(wlPath) ?? new List<string>();
+                    foreach (var n in persisted) if (!string.IsNullOrWhiteSpace(n)) allowed.Add(n.Trim());
+                }
+            }
+            catch { /* ignore read problems */ }
+
+            // Optional extras this run (also persisted)
+            var addOpt = new PromptStringOptions("\nAdditional block names to recognize (comma-separated, Enter for none): ")
+            { AllowSpaces = true };
+            var addRes = ed.GetString(addOpt);
+            var extras = new List<string>();
+            if (addRes.Status == PromptStatus.OK && !string.IsNullOrWhiteSpace(addRes.StringResult))
+            {
+                foreach (var raw in addRes.StringResult.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var n = raw.Trim();
+                    if (n.Length == 0) continue;
+                    if (allowed.Add(n)) extras.Add(n);
+                }
+            }
+            if (extras.Count > 0)
+            {
+                // merge + persist
+                var merged = new HashSet<string>(allowed, StringComparer.OrdinalIgnoreCase);
+                Json.Save(wlPath, merged.ToList());
+                ed.WriteMessage($"\nWhitelist updated: {wlPath}");
+            }
+
+            // User selection (avoids detail blocks elsewhere)
+            var psr = Cad.PromptSelect("Select evidence blocks (window/crossing recommended)",
+                new TypedValue((int)DxfCode.Start, "INSERT"));
+            if (psr.Status != PromptStatus.OK) return;
+
+            // Load existing links (so we don't duplicate by handle)
+            EvidenceLinks links;
+            string evPath = Config.EvidenceJsonPath();
+            if (File.Exists(evPath)) links = Json.Load<EvidenceLinks>(evPath) ?? new EvidenceLinks();
+            else links = new EvidenceLinks();
+
+            var byHandle = new Dictionary<string, EvidencePoint>(StringComparer.OrdinalIgnoreCase);
+            foreach (var p in links.Points) if (!string.IsNullOrEmpty(p.Handle)) byHandle[p.Handle] = p;
+
+            const string LabelLayer = "EVIDENCE_TAGS";
+            const double LabelHeight = 5.0; // requested 5
+            Cad.EnsureLayer(LabelLayer, aci: 2 /* yellow-ish */);
+
+            int added = 0, labeled = 0;
+
+            using (var tr = Cad.Db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(Cad.Db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                // helper: check if a label already exists near a point
+                bool HasLabelNear(Transaction t, string layer, string text, Point2d p, double tol)
+                {
+                    double tol2 = tol * tol;
+                    foreach (ObjectId eid in ms)
+                    {
+                        var e = t.GetObject(eid, OpenMode.ForRead) as Entity;
+                        if (e is not DBText dt) continue;
+                        if (!string.Equals(e.Layer, layer, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!string.Equals((dt.TextString ?? "").Trim(), text, StringComparison.Ordinal)) continue;
+
+                        // use AlignmentPoint if set, else Position
+                        var pos3 = (dt.AlignmentPoint.IsEqualTo(Point3d.Origin)) ? dt.Position : dt.AlignmentPoint;
+                        double dx = pos3.X - p.X, dy = pos3.Y - p.Y;
+                        if (dx * dx + dy * dy <= tol2) return true;
+                    }
+                    return false;
+                }
+
+                // We number by order in JSON: index+1. New items append, so existing numbers stay stable.
+                foreach (var id in psr.Value.GetObjectIds())
+                {
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    string bname = GetBlockName(br, tr);
+                    if (!allowed.Contains(bname)) continue;
+
+                    string h = br.Handle.ToString();
+                    if (!byHandle.TryGetValue(h, out var ep))
+                    {
+                        // New evidence point
+                        bool strong = string.Equals(bname, "FDI", StringComparison.OrdinalIgnoreCase);
+                        bool weak = string.Equals(bname, "fdspike", StringComparison.OrdinalIgnoreCase);
+
+                        ep = new EvidencePoint
+                        {
+                            PlanId = "",
+                            Handle = h,
+                            X = br.Position.X,
+                            Y = br.Position.Y,
+                            EvidenceType = bname,
+                            Held = strong,
+                            Priority = strong ? 2 : (weak ? 0 : 1)
+                        };
+                        links.Points.Add(ep);
+                        byHandle[h] = ep;
+                        added++;
+                    }
+
+                    // Determine its stable number (# = 1-based index in the JSON list)
+                    int num = links.Points.FindIndex(p => string.Equals(p.Handle, h, StringComparison.OrdinalIgnoreCase)) + 1;
+                    if (num <= 0) num = 1;
+
+                    // Label at the insert point if not already there
+                    var p2 = new Point2d(br.Position.X, br.Position.Y);
+                    string labelText = $"#{num}";
+                    if (!HasLabelNear(tr, LabelLayer, labelText, p2, tol: LabelHeight * 0.35))
+                    {
+                        var txt = new DBText
+                        {
+                            Layer = LabelLayer,
+                            TextString = labelText,
+                            Height = LabelHeight,
+                            Justify = AttachmentPoint.MiddleCenter,
+                            AlignmentPoint = new Point3d(p2.X, p2.Y, 0),
+                            Position = new Point3d(p2.X, p2.Y, 0)
+                        };
+                        ms.AppendEntity(txt);
+                        tr.AddNewlyCreatedDBObject(txt, true);
+                        txt.AdjustAlignment(Cad.Db);
+                        labeled++;
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            Json.Save(evPath, links);
+            ed.WriteMessage($"\nHarvested {added} new evidence; labeled {labeled}. Saved: {evPath}\n" +
+                            $"Open EVILINK to pick Held + assign PlanIDs when ready.");
+        }
+        [CommandMethod("ALSWIZARD")]
+        public void AlsWizard()
+        {
+            var ed = Cad.Ed;
+            ed.WriteMessage("\nALSWIZARD — COGO (if needed) → EVIHARVEST → EVILINK → ALSADJ.");
+
+            // Ensure we have a plan JSON
+            string planPath = Config.PlanJsonPath();
+            if (!File.Exists(planPath))
+            {
+                var k = new PromptKeywordOptions("\nNo plan found. Build one now with PLANCOGO? [Yes/No] <Yes>: ");
+                k.Keywords.Add("Yes"); k.Keywords.Add("No"); k.AllowNone = true;
+                var r = ed.GetKeywords(k);
+                bool go = !(r.Status == PromptStatus.OK && r.StringResult == "No");
+                if (!go) { ed.WriteMessage("\nNeed a plan to continue."); return; }
+
+                // Launch your existing COGO builder
+                PlanCogo();
+
+                if (!File.Exists(planPath))
+                {
+                    ed.WriteMessage("\nPLANCOGO was cancelled. Exiting.");
+                    return;
+                }
+            }
+
+            // 1) Harvest & label evidence (user window-selects and we number/label)
+            EvidenceHarvest();
+
+            // 2) Open the table so the user can set Held + PlanID (P#)
+            Evilink();
+
+            // 3) Auto-run ALS adjustment (SimilarityBetween, as in your current ALSADJ default)
+            AlsAdj();
+        }
 
 
         // -------- PLANLINK --------
@@ -1106,20 +1339,15 @@ namespace SurveyCalculator
         public void AlsAdj()
         {
             var ed = Cad.Ed;
-            ed.WriteMessage("\nALSADJ — hold anchors, re-drive between anchors by plan numbers with compass closure.");
+            ed.WriteMessage("\nALSADJ — hold anchors, re-drive between anchors by plan numbers (Similarity only).");
 
-            var mopt = new PromptKeywordOptions("\nBetween held anchors use [Similarity/Compass] <Similarity>: ");
-            mopt.Keywords.Add("Similarity");
-            mopt.Keywords.Add("Compass");
-            mopt.AllowNone = true;
-            var mres = ed.GetKeywords(mopt);
-            bool useSimBetween = !(mres.Status == PromptStatus.OK && mres.StringResult == "Compass");
-
+            // Load plan
             string planPath = Config.PlanJsonPath();
-            if (!File.Exists(planPath)) { ed.WriteMessage($"\nMissing: {planPath}. Run PLANEXTRACT."); return; }
+            if (!File.Exists(planPath)) { ed.WriteMessage($"\nMissing: {planPath}. Run PLANEXTRACT/PLANCOGO/PLANFROMTEXT."); return; }
             var plan = Json.Load<PlanData>(planPath);
             if (plan.Count < 2 || plan.Edges.Count < 1) { ed.WriteMessage("\nPlan data invalid — need at least one leg and two vertices."); return; }
 
+            // Load evidence
             string evPath = Config.EvidenceJsonPath();
             if (!File.Exists(evPath)) { ed.WriteMessage($"\nMissing: {evPath}. Run EVILINK."); return; }
             var links = Json.Load<EvidenceLinks>(evPath);
@@ -1146,16 +1374,6 @@ namespace SurveyCalculator
             { ed.WriteMessage("\nCould not solve similarity transform from Held pairs."); return; }
             var (k, c, s, t, usedScale) = DecideScalingALS(pairs, kf, cf, sf, tf, ed);
 
-            // Transform entire synthetic loop to drawing frame
-            var planXY = new List<Point2d>(synth.Count);
-            for (int i = 0; i < synth.Count; i++)
-            {
-                var p = synth[i];
-                double x = k * (c * p.X - s * p.Y) + t.X;
-                double y = k * (s * p.X + c * p.Y) + t.Y;
-                planXY.Add(new Point2d(x, y));
-            }
-
             // Prepare adjusted coords + solve tags; seed held directly from evidence
             var adj = new Point2d[plan.Count];
             var tag = new Dictionary<int, SolveTag>();
@@ -1170,108 +1388,40 @@ namespace SurveyCalculator
                 }
             }
 
-            // Re-drive segments between held vertices (supports open chains)
+            // Re-drive segments between held vertices (supports open/closed)
             var heldIdx = held.Where(h => idToIndex.ContainsKey(h.PlanId))
                               .Select(h => idToIndex[h.PlanId])
                               .Distinct()
                               .OrderBy(i => i)
                               .ToList();
-            // NOTE: plan may be open; we handle both.
-
-            // --- PASS 0: single-vertex fixes by ALS rules ---
-            // If a vertex has BOTH adjacent neighbors held -> try bearing–bearing intersection.
-            // If angle is too acute/parallel, fall back to plan proportioning on the baseline between neighbors.
-            const double MinIntersectAngleDeg = 10.0;   // below this, use proportion
-            const double MaxIntersectAngleDeg = 170.0;  // near straight -> proportion
-            for (int i = 0; i < plan.Count; i++)
-            {
-                if (isHeld[i]) continue;
-                int im1 = (i - 1 + plan.Count) % plan.Count;
-                int ip1 = (i + 1) % plan.Count;
-                // For open plans, skip wrap neighbors that don't exist
-                if (!plan.Closed && (i == 0 || i == plan.Count - 1)) continue;
-                if (im1 < 0 || ip1 < 0) continue;
-                if (!isHeld[im1] || !isHeld[ip1]) continue;
-
-                var ePrev = plan.EdgeAt(im1);          // im1 -> i
-                var eNext = plan.EdgeAt(i);            // i -> ip1
-
-                var A = adj[im1];
-                var B = adj[ip1];
-
-                double dirIn1 = ePrev.BearingRad;                      // toward i
-                double dirIn2 = Normalize(eNext.BearingRad + Math.PI); // from ip1 back toward i
-
-                var v1 = new Vector2d(Math.Cos(dirIn1), Math.Sin(dirIn1));
-                var v2 = new Vector2d(Math.Cos(dirIn2), Math.Sin(dirIn2));
-
-                double ang = AngleBetween(dirIn1, dirIn2) * 180.0 / Math.PI;
-                bool angleOK = (ang >= MinIntersectAngleDeg && ang <= MaxIntersectAngleDeg);
-
-                if (angleOK && TryLineIntersection(A, v1, B, v2, out var P))
-                {
-                    // ensure forward along both rays (non-negative projection), allow small epsilon
-                    var d1 = new Vector2d(P.X - A.X, P.Y - A.Y);
-                    var d2 = new Vector2d(P.X - B.X, P.Y - B.Y);
-                    if (d1.X * v1.X + d1.Y * v1.Y >= -1e-4 && d2.X * v2.X + d2.Y * v2.Y >= -1e-4)
-                    {
-                        adj[i] = P;
-                        isHeld[i] = true;
-                        tag[i] = SolveTag.BearingIntersection;
-                        continue;
-                    }
-                }
-
-                // Fallback: proportion along baseline AB by plan distances L(im1->i) and L(i->ip1)
-                double L1 = ePrev.Distance, L2 = eNext.Distance;
-                double r = L1 / Math.Max(1e-12, (L1 + L2));
-                adj[i] = new Point2d(A.X + r * (B.X - A.X), A.Y + r * (B.Y - A.Y));
-                isHeld[i] = true;
-                tag[i] = SolveTag.Proportion;
-            }
-
-            // Recompute held index set (now includes the auto-fixed vertices)
-            heldIdx = Enumerable.Range(0, plan.Count).Where(ix => isHeld[ix]).OrderBy(ix => ix).ToList();
 
             int n = plan.Count;
 
-            // 1) Segments BETWEEN adjacent held anchors  (compass traverse)
+            // 1) Segments BETWEEN adjacent held anchors (SimilarityBetween)
             for (int hIdx = 0; hIdx < heldIdx.Count - 1; hIdx++)
             {
                 int start = heldIdx[hIdx];
-                int end   = heldIdx[hIdx + 1];
+                int end = heldIdx[hIdx + 1];
 
                 var chain = new List<PlanEdge>();
-                for (int i = start; i < end; i++) chain.Add(plan.EdgeAt(i));
+                for (int ii = start; ii < end; ii++) chain.Add(plan.EdgeAt(ii));
 
                 var startXY = adj[start];
-                var endXY   = adj[end];
+                var endXY = adj[end];
 
-                List<Point2d> drove;
-                double closure = 0;
-
-                if (useSimBetween)
-                {
-                    drove = TwoPointSimilarityBetween(startXY, endXY, chain);
-                }
-                else
-                {
-                    drove = TraverseSolver.DriveBetween(startXY, endXY, chain, Config.ClosureWarningMeters, out closure);
-                    if (closure > Config.ClosureWarningMeters)
-                        Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
-                }
+                var drove = TwoPointSimilarityBetween(startXY, endXY, chain);
 
                 int kidx = 0;
-                var segTag = useSimBetween ? SolveTag.SimilarityBetween : SolveTag.CompassTraverse;
+                var segTag = SolveTag.SimilarityBetween;
                 for (int j = start; j < end; j++) { adj[j] = drove[kidx++]; tag[j] = segTag; }
-                adj[end] = drove[kidx]; tag[end] = tag.ContainsKey(end) ? tag[end] : segTag;
+                adj[end] = drove[kidx]; if (!tag.ContainsKey(end)) tag[end] = segTag;
             }
 
             // 2) If the plan is CLOSED, also do the wrap segment (last held → first held)
             if (plan.Closed && heldIdx.Count >= 2)
             {
                 int start = heldIdx[^1];
-                int end   = heldIdx[0];
+                int end = heldIdx[0];
 
                 var chain = new List<PlanEdge>();
                 int i = start;
@@ -1282,33 +1432,21 @@ namespace SurveyCalculator
                 }
 
                 var startXY = adj[start];
-                var endXY   = adj[end];
+                var endXY = adj[end];
 
-                List<Point2d> drove;
-                double closure = 0;
-
-                if (useSimBetween)
-                {
-                    drove = TwoPointSimilarityBetween(startXY, endXY, chain);
-                }
-                else
-                {
-                    drove = TraverseSolver.DriveBetween(startXY, endXY, chain, Config.ClosureWarningMeters, out closure);
-                    if (closure > Config.ClosureWarningMeters)
-                        Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
-                }
+                var drove = TwoPointSimilarityBetween(startXY, endXY, chain);
 
                 int kidx = 0; i = start;
-                var segTag = useSimBetween ? SolveTag.SimilarityBetween : SolveTag.CompassTraverse;
+                var segTag = SolveTag.SimilarityBetween;
                 while (i != end) { adj[i] = drove[kidx++]; tag[i] = segTag; i = (i + 1) % n; }
-                adj[end] = drove[kidx]; tag[end] = tag.ContainsKey(end) ? tag[end] : segTag;
+                adj[end] = drove[kidx]; if (!tag.ContainsKey(end)) tag[end] = segTag;
             }
 
             // 3) OPEN tails: propagate one-way from nearest held (no closure); mark as BearingDistance
             if (!plan.Closed && heldIdx.Count >= 1)
             {
                 int firstHeld = heldIdx[0];
-                int lastHeld  = heldIdx[^1];
+                int lastHeld = heldIdx[^1];
 
                 // Left tail (… P0 ← ... ← P[firstHeld])
                 if (firstHeld > 0)
@@ -1367,17 +1505,19 @@ namespace SurveyCalculator
                 if (d < Config.ResidualArrowMinLen) continue; residualCount++; DrawResidualArrow(evPt, adPt, d);
             }
 
-            // CSV
-            // build method map by PlanID
+            // CSV (always label SimilarityBetween if no explicit tag was set)
             var methodById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < plan.Count; i++)
             {
-                if (!tag.TryGetValue(i, out var tg)) tg = SolveTag.CompassTraverse;
+                if (!tag.TryGetValue(i, out var tg)) tg = SolveTag.SimilarityBetween;
                 methodById[plan.VertexIds[i]] = tg.ToString();
             }
-            WriteCsvReport(plan, links, adj, k, Math.Atan2(s, c), methodById);
 
-            ed.WriteMessage($"\nALSADJ done. {(usedScale ? \"Scale applied.\" : \"Scale locked.\")} Adjusted boundary on {Config.LayerAdjusted}. Residuals on {Config.LayerResiduals} ({residualCount}).\nCSV: {Config.ReportCsvPath()}");
+            var outPath = WriteCsvReport(plan, links, adj, k, Math.Atan2(s, c), methodById);
+
+            ed.WriteMessage($"\nALSADJ done. {(usedScale ? "Scale applied." : "Scale locked.")} " +
+                            $"Adjusted boundary on {Config.LayerAdjusted}. Residuals on {Config.LayerResiduals} ({residualCount})." +
+                            $"\nCSV: {outPath}");
         }
 
         private static List<Point2d> TwoPointSimilarityBetween(Point2d startHeld, Point2d endHeld,
@@ -1445,7 +1585,7 @@ namespace SurveyCalculator
             Cad.AddToModelSpace(new Line(new Point3d(toAdj.X, toAdj.Y, 0), new Point3d(a2.X, a2.Y, 0)) { Layer = Config.LayerResiduals, Color = color });
         }
 
-        private static void WriteCsvReport(
+        private static string WriteCsvReport(
             PlanData plan,
             EvidenceLinks links,
             Point2d[] adj,
@@ -1462,7 +1602,6 @@ namespace SurveyCalculator
             bool hasMethod = methodById != null && methodById.Count > 0;
             sb.AppendLine("PlanID,Held,Field_X,Field_Y,Adj_X,Adj_Y,Residual_m,EvidenceType,Seg_Distance_m,Seg_Bearing,Scale,Rotation_deg" + (hasMethod ? ",SolveMethod" : ""));
 
-            // Local CSV escaper
             static string Csv(string s)
                 => string.IsNullOrEmpty(s) ? "" :
                    (s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s);
@@ -1485,7 +1624,6 @@ namespace SurveyCalculator
                     evType = ev.EvidenceType ?? "";
                 }
 
-                // Safe segment fields for open plans (last vertex has no outgoing edge)
                 string segDist = "";
                 string segBearing = "";
                 if (i < plan.Edges.Count)
@@ -1516,7 +1654,9 @@ namespace SurveyCalculator
                 sb.AppendLine(row);
             }
 
-            File.WriteAllText(Config.ReportCsvPath(), sb.ToString(), Encoding.UTF8);
+            // Write with fallback if the file is locked (e.g., open in Excel)
+            string usedPath = WriteTextWithFallback(Config.ReportCsvPath(), sb.ToString());
+            return usedPath;
         }
     }
 }
