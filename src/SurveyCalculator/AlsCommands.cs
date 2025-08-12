@@ -544,6 +544,15 @@ namespace SurveyCalculator
             P = new Point2d(A.X + t * dirA.X, A.Y + t * dirA.Y);
             return true;
         }
+        private static bool TryParseDistance(string raw, out double val)
+        {
+            val = 0;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+            // strip everything except digits, sign and decimal point
+            var cleaned = Regex.Replace(raw, @"[^\d\.\-+]", "");
+            return double.TryParse(cleaned, NumberStyles.Float, CultureInfo.InvariantCulture, out val);
+        }
+
 
         // -------- PLANLINK --------
         [CommandMethod("PLANLINK")]
@@ -740,7 +749,7 @@ namespace SurveyCalculator
                     if (!BearingParserEx.TryParseToAzimuthRad(btxt, out double az))
                     { ed.WriteMessage($"\nInvalid bearing: {btxt}"); return; }
 
-                    if (!double.TryParse(dtxt, NumberStyles.Float, CultureInfo.InvariantCulture, out double dist) || dist <= 0)
+                    if (!TryParseDistance(dtxt, out double dist) || dist <= 0)
                     { ed.WriteMessage($"\nInvalid distance: {dtxt}"); return; }
 
                     double dUse = applyCsf ? dist * csf : dist;
@@ -900,7 +909,7 @@ namespace SurveyCalculator
                 if (perD.Status != PromptStatus.OK) { ed.WriteMessage("\nCancelled."); return; }
 
                 string distRaw = GetTextContent(perD.ObjectId);
-                if (!double.TryParse(distRaw, NumberStyles.Float, CultureInfo.InvariantCulture, out double distVal) || distVal <= 0)
+                if (!TryParseDistance(distRaw, out double distVal) || distVal <= 0)
                 {
                     ed.WriteMessage($"\nCannot parse distance from \"{distRaw}\".");
                     return;
@@ -1102,7 +1111,7 @@ namespace SurveyCalculator
             string planPath = Config.PlanJsonPath();
             if (!File.Exists(planPath)) { ed.WriteMessage($"\nMissing: {planPath}. Run PLANEXTRACT."); return; }
             var plan = Json.Load<PlanData>(planPath);
-            if (plan.Count < 3 || plan.Edges.Count < 3) { ed.WriteMessage("\nPlan data invalid."); return; }
+            if (plan.Count < 2 || plan.Edges.Count < 1) { ed.WriteMessage("\nPlan data invalid — need at least one leg and two vertices."); return; }
 
             string evPath = Config.EvidenceJsonPath();
             if (!File.Exists(evPath)) { ed.WriteMessage($"\nMissing: {evPath}. Run EVILINK."); return; }
@@ -1381,24 +1390,77 @@ namespace SurveyCalculator
             Cad.AddToModelSpace(new Line(new Point3d(toAdj.X, toAdj.Y, 0), new Point3d(a2.X, a2.Y, 0)) { Layer = Config.LayerResiduals, Color = color });
         }
 
-        private static void WriteCsvReport(PlanData plan, EvidenceLinks links, Point2d[] adj, double scale, double rotRad, Dictionary<string,string> methodById = null)
+        private static void WriteCsvReport(
+            PlanData plan,
+            EvidenceLinks links,
+            Point2d[] adj,
+            double scale,
+            double rotRad,
+            Dictionary<string, string> methodById = null)
         {
-            var dictEv = links.Points.Where(p => !string.IsNullOrWhiteSpace(p.PlanId))
-                                     .GroupBy(p => p.PlanId, StringComparer.OrdinalIgnoreCase)
-                                     .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+            var dictEv = links.Points
+                .Where(p => !string.IsNullOrWhiteSpace(p.PlanId))
+                .GroupBy(p => p.PlanId, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
             var sb = new StringBuilder();
             bool hasMethod = methodById != null && methodById.Count > 0;
             sb.AppendLine("PlanID,Held,Field_X,Field_Y,Adj_X,Adj_Y,Residual_m,EvidenceType,Seg_Distance_m,Seg_Bearing,Scale,Rotation_deg" + (hasMethod ? ",SolveMethod" : ""));
+
+            // Local CSV escaper
+            static string Csv(string s)
+                => string.IsNullOrEmpty(s) ? "" :
+                   (s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s);
+
             for (int i = 0; i < plan.Count; i++)
             {
-                string id = plan.VertexIds[i]; var a = adj[i];
-                bool held = false; double fx = double.NaN, fy = double.NaN, resid = double.NaN; string evType = "";
-                if (dictEv.TryGetValue(id, out var ev)) { held = ev.Held; fx = ev.X; fy = ev.Y; resid = Math.Sqrt((fx - a.X) * (fx - a.X) + (fy - a.Y) * (fy - a.Y)); evType = ev.EvidenceType ?? ""; }
-                var e = plan.EdgeAt(i); string bearing = Cad.FormatBearing(e.BearingRad);
-                var row = $"{id},{(held ? "Y" : "N")},{(double.IsNaN(fx) ? "" : fx.ToString("0.###"))},{(double.IsNaN(fy) ? "" : fy.ToString("0.###"))},{a.X:0.###},{a.Y:0.###},{(double.IsNaN(resid) ? "" : resid.ToString("0.###"))},{evType},{e.Distance:0.###},{bearing},{scale:0.000000},{(rotRad*180.0/Math.PI):0.000}";
-                if (hasMethod && methodById.TryGetValue(id, out var mth)) row += "," + mth;
+                string id = plan.VertexIds[i];
+                var a = adj[i];
+
+                bool held = false;
+                double fx = double.NaN, fy = double.NaN, resid = double.NaN;
+                string evType = "";
+
+                if (dictEv.TryGetValue(id, out var ev))
+                {
+                    held = ev.Held;
+                    fx = ev.X;
+                    fy = ev.Y;
+                    resid = Math.Sqrt((fx - a.X) * (fx - a.X) + (fy - a.Y) * (fy - a.Y));
+                    evType = ev.EvidenceType ?? "";
+                }
+
+                // Safe segment fields for open plans (last vertex has no outgoing edge)
+                string segDist = "";
+                string segBearing = "";
+                if (i < plan.Edges.Count)
+                {
+                    var e = plan.EdgeAt(i);
+                    segDist = e.Distance.ToString("0.###", CultureInfo.InvariantCulture);
+                    segBearing = Cad.FormatBearing(e.BearingRad);
+                }
+
+                var row = string.Join(",",
+                    id,
+                    held ? "Y" : "N",
+                    double.IsNaN(fx) ? "" : fx.ToString("0.###", CultureInfo.InvariantCulture),
+                    double.IsNaN(fy) ? "" : fy.ToString("0.###", CultureInfo.InvariantCulture),
+                    a.X.ToString("0.###", CultureInfo.InvariantCulture),
+                    a.Y.ToString("0.###", CultureInfo.InvariantCulture),
+                    double.IsNaN(resid) ? "" : resid.ToString("0.###", CultureInfo.InvariantCulture),
+                    Csv(evType),
+                    segDist,
+                    Csv(segBearing),
+                    scale.ToString("0.000000", CultureInfo.InvariantCulture),
+                    (rotRad * 180.0 / Math.PI).ToString("0.000", CultureInfo.InvariantCulture)
+                );
+
+                if (hasMethod && methodById.TryGetValue(id, out var mth))
+                    row += "," + Csv(mth);
+
                 sb.AppendLine(row);
             }
+
             File.WriteAllText(Config.ReportCsvPath(), sb.ToString(), Encoding.UTF8);
         }
     }
