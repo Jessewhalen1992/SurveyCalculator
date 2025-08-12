@@ -375,6 +375,60 @@ namespace SurveyCalculator
         }
     }
 
+    internal static class PlanBuild
+    {
+        public static PlanData BuildPlanFromEdges(IReadOnlyList<(double L, double az)> edges, out double closureLen)
+        {
+            var plan = new PlanData { CombinedScaleFactor = 1.0 };
+            var cur = new Point2d(0, 0);
+            plan.VertexIds.Add("P1");
+            plan.VertexXY.Add(new XY(cur.X, cur.Y));
+
+            for (int i = 0; i < edges.Count; i++)
+            {
+                var (L, az) = edges[i];
+                var next = new Point2d(cur.X + L * Math.Cos(az), cur.Y + L * Math.Sin(az));
+                string fromId = $"P{i + 1}";
+                string toId   = $"P{i + 2}";
+                plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = L, BearingRad = az });
+                plan.VertexIds.Add(toId);
+                plan.VertexXY.Add(new XY(next.X, next.Y));
+                cur = next;
+            }
+
+            var first = new Point2d(plan.VertexXY[0].X, plan.VertexXY[0].Y);
+            var last  = new Point2d(plan.VertexXY[^1].X, plan.VertexXY[^1].Y);
+            closureLen = Cad.Distance(first, last);
+            plan.Closed = closureLen < 1e-6;
+            return plan;
+        }
+
+        public static void SaveAndDraw(PlanData plan, double closureLen, string tag)
+        {
+            var ed = Cad.Ed;
+            string path = Config.PlanJsonPath();
+            Json.Save(path, plan);
+            ed.WriteMessage($"\nWrote plan to: {path}");
+
+            Cad.EnsureLayer(Config.LayerPdf, aci: 4);
+            var pl = new Polyline { Layer = Config.LayerPdf, Closed = plan.Closed };
+            for (int i = 0; i < plan.VertexXY.Count; i++)
+            {
+                var v = plan.VertexXY[i];
+                pl.AddVertexAt(i, new Point2d(v.X, v.Y), 0, 0, 0);
+            }
+            Cad.AddToModelSpace(pl);
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"\\LPlan ({tag}) Summary\\l");
+            sb.AppendLine($"Vertices: {plan.Count}");
+            sb.AppendLine($"Perimeter: {plan.Edges.Sum(e => e.Distance):0.###} m");
+            sb.AppendLine($"Closure: {closureLen:0.###} m");
+            var mt = new MText { Contents = sb.ToString(), Location = new Point3d(0, 0, 0), TextHeight = 2.5, Layer = Config.LayerPdf };
+            Cad.AddToModelSpace(mt);
+        }
+    }
+
     // ---------------------------- EVILINK Form ----------------------------
     // ---------------------------- EVILINK Form ----------------------------
     public class EvilinkForm : Form
@@ -434,7 +488,7 @@ namespace SurveyCalculator
             btnCancel.Click += (s, e) => { this.DialogResult = DialogResult.Cancel; this.Close(); };
 
             // Tip label
-            lbl.Text = "Tip: If you used PLANCOGO, PlanIDs won’t auto-snap until you assign them; FDI auto‑Held, fdspike not held by default.";
+            lbl.Text = "Tip: If you used PLANCOGO or PLANFROMTEXT, PlanIDs won’t auto‑snap; assign them manually. FDI auto‑Held, fdspike not held by default.";
             lbl.Top = 405;
             lbl.Left = 10;
             lbl.Width = 560;
@@ -749,12 +803,131 @@ namespace SurveyCalculator
             ed.WriteMessage("\nNext step: EVILINK → assign Held evidence (P#) → ALSADJ.");
         }
 
+        /// <summary>
+        /// Reads the text content of a DBText or MText entity.
+        /// </summary>
+        private string GetTextContent(ObjectId id)
+        {
+            using var tr = Cad.Db.TransactionManager.StartTransaction();
+            var obj = tr.GetObject(id, OpenMode.ForRead, false);
+            if (obj is DBText dbt) return dbt.TextString.Trim();
+            if (obj is MText mt) return mt.Contents.Trim();
+            return "";
+        }
+
+        // -------- PLANFROMTEXT --------
+        [CommandMethod("PLANFROMTEXT")]
+        public void PlanFromText()
+        {
+            var ed = Cad.Ed;
+            ed.WriteMessage("\nPLANFROMTEXT — extract bearing/distances by selecting text objects.");
+
+            // Collect calls (azimuth rad, distance, original bearing text, original distance text)
+            var calls = new List<(double azRad, double dist, string btxt, string dtxt)>();
+            int leg = 1;
+
+            while (true)
+            {
+                // Prompt for bearing text
+                var peo = new PromptEntityOptions($"\nLeg {leg}: Select BEARING text (Enter to finish)");
+                peo.SetRejectMessage("\n  Only text (DBText/MText) allowed.");
+                peo.AddAllowedClass(typeof(DBText), true);
+                peo.AddAllowedClass(typeof(MText), true);
+                var perB = ed.GetEntity(peo);
+
+                if (perB.Status != PromptStatus.OK)
+                {
+                    // finish if we have at least 2 calls
+                    if (calls.Count >= 2) break;
+                    ed.WriteMessage("\nNeed at least 2 calls before finishing.");
+                    return;
+                }
+
+                string bearingRaw = GetTextContent(perB.ObjectId);
+                if (!BearingParserEx.TryParseToAzimuthRad(bearingRaw, out double az))
+                {
+                    ed.WriteMessage($"\nCannot parse bearing from \"{bearingRaw}\".");
+                    return;
+                }
+
+                // Prompt for distance text
+                var ped = new PromptEntityOptions($"Leg {leg}: Select DISTANCE text");
+                ped.SetRejectMessage("\n  Only text (DBText/MText) allowed.");
+                ped.AddAllowedClass(typeof(DBText), true);
+                ped.AddAllowedClass(typeof(MText), true);
+                var perD = ed.GetEntity(ped);
+                if (perD.Status != PromptStatus.OK) { ed.WriteMessage("\nCancelled."); return; }
+
+                string distRaw = GetTextContent(perD.ObjectId);
+                if (!double.TryParse(distRaw, NumberStyles.Float, CultureInfo.InvariantCulture, out double distVal) || distVal <= 0)
+                {
+                    ed.WriteMessage($"\nCannot parse distance from \"{distRaw}\".");
+                    return;
+                }
+
+                calls.Add((az, distVal, bearingRaw, distRaw));
+                leg++;
+            }
+
+            // Ask whether to close the figure (generate computed closing leg)
+            var closeOpt = new PromptKeywordOptions("\nClose the figure? [Yes/No] <Yes>: ");
+            closeOpt.Keywords.Add("Yes");
+            closeOpt.Keywords.Add("No");
+            closeOpt.AllowNone = true;
+            var cr = ed.GetKeywords(closeOpt);
+            bool closeIt = !(cr.Status == PromptStatus.OK && cr.StringResult == "No");
+
+            // Generate rows for CSV and edges for PlanData
+            var csvRows = new List<string>();
+            var edges = new List<(double L, double az)>();
+            for (int i = 0; i < calls.Count; i++)
+            {
+                var c = calls[i];
+                string fromId = $"P{i + 1}";
+                string toId   = $"P{i + 2}";
+                edges.Add((c.dist, c.azRad));
+                csvRows.Add($"{fromId},{toId},{c.btxt},{c.dtxt}");
+            }
+
+            // Optionally add closing leg
+            if (closeIt)
+            {
+                // Compute closure vector (from last to first)
+                double sumX = 0, sumY = 0;
+                for (int i = 0; i < calls.Count; i++)
+                {
+                    sumX += calls[i].dist * Math.Cos(calls[i].azRad);
+                    sumY += calls[i].dist * Math.Sin(calls[i].azRad);
+                }
+                double dx = -sumX;
+                double dy = -sumY;
+                double closureDist = Math.Sqrt(dx * dx + dy * dy);
+                double closureAz   = Math.Atan2(dy, dx);
+                if (closureAz < 0) closureAz += 2 * Math.PI;
+
+                edges.Add((closureDist, closureAz));
+                string fromLast = $"P{calls.Count + 1}";
+                csvRows.Add($"{fromLast},P1,COMPUTED,{closureDist.ToString("0.###", CultureInfo.InvariantCulture)}");
+            }
+
+            // Write CSV next to DWG
+            string csvPath = Path.Combine(Config.CurrentDwgFolder(), $"{Config.Stem()}_SelectedCalls.csv");
+            File.WriteAllText(csvPath, "FromId,ToId,Bearing,Distance\n" + string.Join("\n", csvRows));
+            ed.WriteMessage($"\nWrote calls CSV: {csvPath}");
+
+            // Build PlanData and write JSON
+            var pdata = PlanBuild.BuildPlanFromEdges(edges, out double closureLen);
+            PlanBuild.SaveAndDraw(pdata, closureLen, "TextSelection");
+
+            ed.WriteMessage("\nNext: run EVILINK, assign Held evidence to P# IDs, then ALSADJ.");
+        }
+
         // -------- PLANEXTRACT --------
         [CommandMethod("PLANEXTRACT")]
         public void PlanExtract()
         {
             var ed = Cad.Ed;
-            ed.WriteMessage("\nPLANEXTRACT (legacy) — PDF linework extraction. Prefer PLANCOGO to build from bearings/distances.");
+            ed.WriteMessage("\nPLANEXTRACT (legacy) — PDF linework extraction. Prefer PLANCOGO or PLANFROMTEXT.");
 
             var peo = new PromptEntityOptions("\nSelect plan boundary polyline: ");
             peo.SetRejectMessage("\nOnly Polyline entities are supported.");
