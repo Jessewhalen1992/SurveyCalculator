@@ -390,6 +390,8 @@ namespace SurveyCalculator
         }
     }
 
+    internal enum SolveTag { Held, BearingDistance, BearingIntersection, Proportion, CompassTraverse }
+
     internal static class PlanBuild
     {
         public static PlanData BuildPlanFromEdges(IReadOnlyList<(double L, double az)> edges, out double closureLen)
@@ -519,6 +521,30 @@ namespace SurveyCalculator
     // ---------------------------- Commands ----------------------------
     public class Commands
     {
+        // ---------- small math helpers ----------
+        static double Normalize(double a)
+        {
+            while (a < 0) a += 2 * Math.PI;
+            while (a >= 2 * Math.PI) a -= 2 * Math.PI;
+            return a;
+        }
+        static double AngleBetween(double a1, double a2)
+        {
+            double d = Math.Abs(Normalize(a1 - a2));
+            if (d > Math.PI) d = 2 * Math.PI - d;
+            return d; // [0, π]
+        }
+        static bool TryLineIntersection(Point2d A, Vector2d dirA, Point2d B, Vector2d dirB, out Point2d P)
+        {
+            // Solve A + t*dirA == B + u*dirB
+            double cross = dirA.X * dirB.Y - dirA.Y * dirB.X;
+            if (Math.Abs(cross) < 1e-12) { P = default; return false; }
+            var c = new Vector2d(B.X - A.X, B.Y - A.Y);
+            double t = (c.X * dirB.Y - c.Y * dirB.X) / cross;
+            P = new Point2d(A.X + t * dirA.X, A.Y + t * dirA.Y);
+            return true;
+        }
+
         // -------- PLANLINK --------
         [CommandMethod("PLANLINK")]
         public void PlanLink()
@@ -1114,9 +1140,19 @@ namespace SurveyCalculator
                 planXY.Add(new Point2d(x, y));
             }
 
-            // Prepare adjusted coords; seed held directly from evidence
+            // Prepare adjusted coords + solve tags; seed held directly from evidence
             var adj = new Point2d[plan.Count];
-            foreach (var h in held) if (idToIndex.TryGetValue(h.PlanId, out int idx)) adj[idx] = h.XY();
+            var tag = new Dictionary<int, SolveTag>();
+            var isHeld = new bool[plan.Count];
+            foreach (var h in held)
+            {
+                if (idToIndex.TryGetValue(h.PlanId, out int idx))
+                {
+                    adj[idx] = h.XY();
+                    isHeld[idx] = true;
+                    tag[idx] = SolveTag.Held;
+                }
+            }
 
             // Re-drive segments between held vertices (supports open chains)
             var heldIdx = held.Where(h => idToIndex.ContainsKey(h.PlanId))
@@ -1124,10 +1160,66 @@ namespace SurveyCalculator
                               .Distinct()
                               .OrderBy(i => i)
                               .ToList();
+            // NOTE: plan may be open; we handle both.
+
+            // --- PASS 0: single-vertex fixes by ALS rules ---
+            // If a vertex has BOTH adjacent neighbors held -> try bearing–bearing intersection.
+            // If angle is too acute/parallel, fall back to plan proportioning on the baseline between neighbors.
+            const double MinIntersectAngleDeg = 10.0;   // below this, use proportion
+            const double MaxIntersectAngleDeg = 170.0;  // near straight -> proportion
+            for (int i = 0; i < plan.Count; i++)
+            {
+                if (isHeld[i]) continue;
+                int im1 = (i - 1 + plan.Count) % plan.Count;
+                int ip1 = (i + 1) % plan.Count;
+                // For open plans, skip wrap neighbors that don't exist
+                if (!plan.Closed && (i == 0 || i == plan.Count - 1)) continue;
+                if (im1 < 0 || ip1 < 0) continue;
+                if (!isHeld[im1] || !isHeld[ip1]) continue;
+
+                var ePrev = plan.EdgeAt(im1);          // im1 -> i
+                var eNext = plan.EdgeAt(i);            // i -> ip1
+
+                var A = adj[im1];
+                var B = adj[ip1];
+
+                double dirIn1 = ePrev.BearingRad;                      // toward i
+                double dirIn2 = Normalize(eNext.BearingRad + Math.PI); // from ip1 back toward i
+
+                var v1 = new Vector2d(Math.Cos(dirIn1), Math.Sin(dirIn1));
+                var v2 = new Vector2d(Math.Cos(dirIn2), Math.Sin(dirIn2));
+
+                double ang = AngleBetween(dirIn1, dirIn2) * 180.0 / Math.PI;
+                bool angleOK = (ang >= MinIntersectAngleDeg && ang <= MaxIntersectAngleDeg);
+
+                if (angleOK && TryLineIntersection(A, v1, B, v2, out var P))
+                {
+                    // ensure forward along both rays (non-negative projection), allow small epsilon
+                    var d1 = new Vector2d(P.X - A.X, P.Y - A.Y);
+                    var d2 = new Vector2d(P.X - B.X, P.Y - B.Y);
+                    if (d1.X * v1.X + d1.Y * v1.Y >= -1e-4 && d2.X * v2.X + d2.Y * v2.Y >= -1e-4)
+                    {
+                        adj[i] = P;
+                        isHeld[i] = true;
+                        tag[i] = SolveTag.BearingIntersection;
+                        continue;
+                    }
+                }
+
+                // Fallback: proportion along baseline AB by plan distances L(im1->i) and L(i->ip1)
+                double L1 = ePrev.Distance, L2 = eNext.Distance;
+                double r = L1 / Math.Max(1e-12, (L1 + L2));
+                adj[i] = new Point2d(A.X + r * (B.X - A.X), A.Y + r * (B.Y - A.Y));
+                isHeld[i] = true;
+                tag[i] = SolveTag.Proportion;
+            }
+
+            // Recompute held index set (now includes the auto-fixed vertices)
+            heldIdx = Enumerable.Range(0, plan.Count).Where(ix => isHeld[ix]).OrderBy(ix => ix).ToList();
 
             int n = plan.Count;
 
-            // 1) Segments BETWEEN adjacent held anchors
+            // 1) Segments BETWEEN adjacent held anchors  (compass traverse)
             for (int hIdx = 0; hIdx < heldIdx.Count - 1; hIdx++)
             {
                 int start = heldIdx[hIdx];
@@ -1145,8 +1237,8 @@ namespace SurveyCalculator
                     Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
 
                 int kidx = 0;
-                for (int j = start; j < end; j++) { adj[j] = drove[kidx++]; }
-                adj[end] = drove[kidx];
+                for (int j = start; j < end; j++) { adj[j] = drove[kidx++]; tag[j] = SolveTag.CompassTraverse; }
+                adj[end] = drove[kidx]; tag[end] = tag.ContainsKey(end) ? tag[end] : SolveTag.CompassTraverse;
             }
 
             // 2) If the plan is CLOSED, also do the wrap segment (last held → first held)
@@ -1172,11 +1264,11 @@ namespace SurveyCalculator
                     Cad.Ed.WriteMessage($"\nWarning: closure {closure:0.###} m between {plan.VertexIds[start]} and {plan.VertexIds[end]} exceeds {Config.ClosureWarningMeters:0.###} m.");
 
                 int kidx = 0; i = start;
-                while (i != end) { adj[i] = drove[kidx++]; i = (i + 1) % n; }
-                adj[end] = drove[kidx];
+                while (i != end) { adj[i] = drove[kidx++]; tag[i] = SolveTag.CompassTraverse; i = (i + 1) % n; }
+                adj[end] = drove[kidx]; tag[end] = tag.ContainsKey(end) ? tag[end] : SolveTag.CompassTraverse;
             }
 
-            // 3) OPEN tails: propagate one-way from nearest held (no closure)
+            // 3) OPEN tails: propagate one-way from nearest held (no closure); mark as BearingDistance
             if (!plan.Closed && heldIdx.Count >= 1)
             {
                 int firstHeld = heldIdx[0];
@@ -1194,7 +1286,12 @@ namespace SurveyCalculator
                     }
                     var droveLeft = TraverseSolver.DriveOpenFrom(adj[firstHeld], revChain);
                     // droveLeft[0] is held; [1] => P[firstHeld-1], ..., last => P0
-                    for (int k = 1; k < droveLeft.Count; k++) adj[firstHeld - k] = droveLeft[k];
+                    for (int kidx = 1; kidx < droveLeft.Count; kidx++)
+                    {
+                        int vi = firstHeld - kidx;
+                        adj[vi] = droveLeft[kidx];
+                        if (!tag.ContainsKey(vi)) tag[vi] = SolveTag.BearingDistance;
+                    }
                 }
 
                 // Right tail (P[lastHeld] → … → P[n-1])
@@ -1204,7 +1301,12 @@ namespace SurveyCalculator
                     for (int i2 = lastHeld; i2 < n - 1; i2++) fwdChain.Add(plan.EdgeAt(i2));
                     var droveRight = TraverseSolver.DriveOpenFrom(adj[lastHeld], fwdChain);
                     // droveRight[0] is held; [1] => P[lastHeld+1], ..., last => P[n-1]
-                    for (int k = 1; k < droveRight.Count; k++) adj[lastHeld + k] = droveRight[k];
+                    for (int kidx = 1; kidx < droveRight.Count; kidx++)
+                    {
+                        int vi = lastHeld + kidx;
+                        adj[vi] = droveRight[kidx];
+                        if (!tag.ContainsKey(vi)) tag[vi] = SolveTag.BearingDistance;
+                    }
                 }
             }
 
@@ -1230,7 +1332,14 @@ namespace SurveyCalculator
             }
 
             // CSV
-            WriteCsvReport(plan, links, adj, k, Math.Atan2(s, c));
+            // build method map by PlanID
+            var methodById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < plan.Count; i++)
+            {
+                if (!tag.TryGetValue(i, out var tg)) tg = SolveTag.CompassTraverse;
+                methodById[plan.VertexIds[i]] = tg.ToString();
+            }
+            WriteCsvReport(plan, links, adj, k, Math.Atan2(s, c), methodById);
 
             ed.WriteMessage($"\nALSADJ done. {(usedScale ? "Scale applied." : "Scale locked.")} Adjusted boundary on {Config.LayerAdjusted}. Residuals on {Config.LayerResiduals} ({residualCount}).\nCSV: {Config.ReportCsvPath()}");
         }
@@ -1249,13 +1358,6 @@ namespace SurveyCalculator
             }
             if (pts.Count != plan.Count) { pts = new List<Point2d>(plan.Count); for (int i = 0; i < plan.Count; i++) pts.Add(new Point2d(i, 0)); }
             return pts;
-        }
-
-        static double Normalize(double a)
-        {
-            while (a < 0) a += 2 * Math.PI;
-            while (a >= 2 * Math.PI) a -= 2 * Math.PI;
-            return a;
         }
 
         private static void DrawResidualArrow(Point2d fromEv, Point2d toAdj, double len)
@@ -1279,20 +1381,23 @@ namespace SurveyCalculator
             Cad.AddToModelSpace(new Line(new Point3d(toAdj.X, toAdj.Y, 0), new Point3d(a2.X, a2.Y, 0)) { Layer = Config.LayerResiduals, Color = color });
         }
 
-        private static void WriteCsvReport(PlanData plan, EvidenceLinks links, Point2d[] adj, double scale, double rotRad)
+        private static void WriteCsvReport(PlanData plan, EvidenceLinks links, Point2d[] adj, double scale, double rotRad, Dictionary<string,string> methodById = null)
         {
             var dictEv = links.Points.Where(p => !string.IsNullOrWhiteSpace(p.PlanId))
                                      .GroupBy(p => p.PlanId, StringComparer.OrdinalIgnoreCase)
                                      .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
             var sb = new StringBuilder();
-            sb.AppendLine("PlanID,Held,Field_X,Field_Y,Adj_X,Adj_Y,Residual_m,EvidenceType,Seg_Distance_m,Seg_Bearing,Scale,Rotation_deg");
+            bool hasMethod = methodById != null && methodById.Count > 0;
+            sb.AppendLine("PlanID,Held,Field_X,Field_Y,Adj_X,Adj_Y,Residual_m,EvidenceType,Seg_Distance_m,Seg_Bearing,Scale,Rotation_deg" + (hasMethod ? ",SolveMethod" : ""));
             for (int i = 0; i < plan.Count; i++)
             {
                 string id = plan.VertexIds[i]; var a = adj[i];
                 bool held = false; double fx = double.NaN, fy = double.NaN, resid = double.NaN; string evType = "";
                 if (dictEv.TryGetValue(id, out var ev)) { held = ev.Held; fx = ev.X; fy = ev.Y; resid = Math.Sqrt((fx - a.X) * (fx - a.X) + (fy - a.Y) * (fy - a.Y)); evType = ev.EvidenceType ?? ""; }
                 var e = plan.EdgeAt(i); string bearing = Cad.FormatBearing(e.BearingRad);
-                sb.AppendLine($"{id},{(held ? "Y" : "N")},{(double.IsNaN(fx) ? "" : fx.ToString("0.###"))},{(double.IsNaN(fy) ? "" : fy.ToString("0.###"))},{a.X:0.###},{a.Y:0.###},{(double.IsNaN(resid) ? "" : resid.ToString("0.###"))},{evType},{e.Distance:0.###},{bearing},{scale:0.000000},{(rotRad*180.0/Math.PI):0.000}");
+                var row = $"{id},{(held ? "Y" : "N")},{(double.IsNaN(fx) ? "" : fx.ToString("0.###"))},{(double.IsNaN(fy) ? "" : fy.ToString("0.###"))},{a.X:0.###},{a.Y:0.###},{(double.IsNaN(resid) ? "" : resid.ToString("0.###"))},{evType},{e.Distance:0.###},{bearing},{scale:0.000000},{(rotRad*180.0/Math.PI):0.000}";
+                if (hasMethod && methodById.TryGetValue(id, out var mth)) row += "," + mth;
+                sb.AppendLine(row);
             }
             File.WriteAllText(Config.ReportCsvPath(), sb.ToString(), Encoding.UTF8);
         }
