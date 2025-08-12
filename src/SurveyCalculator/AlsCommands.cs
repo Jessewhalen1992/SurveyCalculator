@@ -722,17 +722,28 @@ namespace SurveyCalculator
                 plan.Closed = !(kr.Status == PromptStatus.OK && kr.StringResult == "No");
             }
 
-            // Save JSON + quick note
+            // Save JSON
             var path = Config.PlanJsonPath();
             Json.Save(path, plan);
             ed.WriteMessage($"\nWrote plan to: {path}");
 
+            // Draw plan polyline on plan layer
+            Cad.EnsureLayer(Config.LayerPdf, aci: 4);
+            var pl = new Polyline { Layer = Config.LayerPdf, Closed = plan.Closed };
+            for (int i = 0; i < plan.VertexXY.Count; i++)
+            {
+                var v = plan.VertexXY[i];
+                pl.AddVertexAt(i, new Point2d(v.X, v.Y), 0, 0, 0);
+            }
+            Cad.AddToModelSpace(pl);
+
+            // Quick summary MText
             var sb = new StringBuilder();
             sb.AppendLine("\\LPlan (COGO) Summary\\l");
             sb.AppendLine($"Vertices: {plan.Count}");
             sb.AppendLine($"Perimeter (numeric): {plan.Edges.Sum(e => e.Distance):0.###} m");
             sb.AppendLine($"CSF applied: {plan.CombinedScaleFactor:0.######}");
-            var mt = new MText { Contents = sb.ToString(), Location = new Point3d(0,0,0), TextHeight = 2.5 };
+            var mt = new MText { Contents = sb.ToString(), Location = new Point3d(0, 0, 0), TextHeight = 2.5, Layer = Config.LayerPdf };
             Cad.AddToModelSpace(mt);
 
             ed.WriteMessage("\nNext step: EVILINK → assign Held evidence (P#) → ALSADJ.");
