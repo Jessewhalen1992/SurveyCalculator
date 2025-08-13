@@ -12,6 +12,7 @@ using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Globalization;
 using System.Windows.Forms;
+using System.ComponentModel;
 
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.Colors;
@@ -59,13 +60,624 @@ namespace SurveyCalculator
         public static string ReportCsvPath() => Path.Combine(CurrentDwgFolder(), $"{Stem()}_AdjustmentReport.csv");
     }
 
+    // ---------------------------- PLAN COGO UI (Form) ----------------------------
+    public class PlanCogoForm : Form
+    {
+        private class CogoLegRow
+        {
+            public string Bearing { get; set; } = "";
+            public double Distance { get; set; } = 0.0;
+            public bool Locked { get; set; } = false;   // NEW: keep this leg's distance fixed during adjustment
+        }
+        private class VertexMapRow
+        {
+            public string VertexId { get; set; } = "";  // P1, P2, ...
+            public int EvidenceNo { get; set; } = 0;    // 0 = (none), otherwise 1..N
+            public bool Held { get; set; } = false;
+        }
+        private class ComboItem { public int Index { get; set; } public string Label { get; set; } = ""; }
+
+        private readonly DataGridView gridLegs = new DataGridView();
+        private readonly DataGridView gridVerts = new DataGridView();
+
+        private readonly BindingList<CogoLegRow> legs = new BindingList<CogoLegRow>();
+        private readonly BindingList<VertexMapRow> verts = new BindingList<VertexMapRow>();
+
+        private readonly TextBox txtCsf = new TextBox { Width = 80, Text = "1.0" };
+        private readonly CheckBox chkApplyCsf = new CheckBox { Text = "Apply CSF to distances on Save" };
+        private readonly Button btnAddLeg = new Button { Text = "Add Leg" };
+        private readonly Button btnDelLeg = new Button { Text = "Delete Selected" };
+        private readonly Button btnCloseLeg = new Button { Text = "Compute Closing Leg" };
+        private readonly Button btnRefreshVerts = new Button { Text = "Refresh Vertices" };
+
+        private readonly Button btnSave = new Button { Text = "Save" };
+        private readonly Button btnSaveAdj = new Button { Text = "Save & Adjust" };
+        private readonly Button btnCancel = new Button { Text = "Cancel" };
+
+        private readonly Label lblSummary = new Label { AutoSize = true };
+
+        private EvidenceLinks links = new EvidenceLinks();
+        private List<ComboItem> evidenceOptions = new List<ComboItem>();
+
+        public bool RunAdjustAfterSave { get; private set; } = false;
+
+        // --- Units + distance column (class-level so header can change) ---
+        private readonly DataGridViewTextBoxColumn colDist =
+            new DataGridViewTextBoxColumn
+            {
+                HeaderText = "Distance (m)",
+                DataPropertyName = "Distance",
+                Width = 180,
+                DefaultCellStyle = { Format = "0.###" }
+            };
+
+        private enum InputUnits { Meters = 0, Feet = 1, Chains = 2 }
+        private InputUnits currentUnits = InputUnits.Meters;
+
+        private readonly ComboBox cboUnits = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 110 };
+        private readonly Label lblUnits = new Label { AutoSize = true, Text = "Input Units:" };
+
+        public PlanCogoForm()
+        {
+            this.Text = "Plan COGO Editor";
+            this.Width = 1000;
+            this.Height = 650;
+            this.StartPosition = FormStartPosition.CenterScreen;
+
+            // Left: COGO legs
+            var left = new GroupBox { Text = "COGO Legs", Left = 10, Top = 10, Width = 560, Height = 520 };
+            gridLegs.Parent = left; gridLegs.Left = 10; gridLegs.Top = 50; gridLegs.Width = 540; gridLegs.Height = 420;
+            gridLegs.AutoGenerateColumns = false; gridLegs.AllowUserToAddRows = false; gridLegs.RowHeadersVisible = false;
+            gridLegs.DataSource = legs;
+
+            var colLegNo = new DataGridViewTextBoxColumn { HeaderText = "#", ReadOnly = true, Width = 40 };
+            var colFrom = new DataGridViewTextBoxColumn { HeaderText = "From", ReadOnly = true, Width = 60 };
+            var colTo = new DataGridViewTextBoxColumn { HeaderText = "To", ReadOnly = true, Width = 60 };
+            var colBearing = new DataGridViewTextBoxColumn { HeaderText = "Bearing", DataPropertyName = "Bearing", Width = 170 };
+
+            // NEW: Lock checkbox column
+            var colLock = new DataGridViewCheckBoxColumn
+            {
+                HeaderText = "Lock",
+                DataPropertyName = "Locked",
+                Width = 52,
+                ThreeState = false
+            };
+
+            gridLegs.Columns.AddRange(colLegNo, colFrom, colTo, colBearing, colLock, colDist);
+            ConfigureLegsGrid(); // selection mode, no sorting, Delete key handler
+            gridLegs.DataBindingComplete += (s, e) => RefreshLegNumbersAndEnds();
+
+            // Commit checkbox edits immediately
+            gridLegs.CurrentCellDirtyStateChanged += (s, e) =>
+            {
+                if (gridLegs.IsCurrentCellDirty)
+                    gridLegs.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+
+            // Leg tool row
+            var pnlLegTools = new Panel { Parent = left, Left = 10, Top = 20, Width = 540, Height = 28 };
+            btnAddLeg.Parent = pnlLegTools; btnAddLeg.Left = 0; btnAddLeg.Width = 90;
+            btnDelLeg.Parent = pnlLegTools; btnDelLeg.Left = 100; btnDelLeg.Width = 120;
+            btnCloseLeg.Parent = pnlLegTools; btnCloseLeg.Left = 230; btnCloseLeg.Width = 150;
+            btnRefreshVerts.Parent = pnlLegTools; btnRefreshVerts.Left = 390; btnRefreshVerts.Width = 140;
+
+            btnAddLeg.Click += (s, e) => { legs.Add(new CogoLegRow()); RefreshLegNumbersAndEnds(); };
+            btnDelLeg.Click += DeleteSelectedLegs;
+            btnCloseLeg.Click += (s, e) => ComputeClosingLeg();
+            btnRefreshVerts.Click += (s, e) => RebuildVertexList(preserve: true);
+
+            // Right: Vertex ↔ Evidence#
+            var right = new GroupBox { Text = "Vertex ↔ Evidence # (and Held)", Left = 580, Top = 10, Width = 400, Height = 520 };
+            gridVerts.Parent = right; gridVerts.Left = 10; gridVerts.Top = 20; gridVerts.Width = 380; gridVerts.Height = 450;
+            gridVerts.AutoGenerateColumns = false; gridVerts.AllowUserToAddRows = false; gridVerts.RowHeadersVisible = false;
+            gridVerts.DataSource = verts;
+
+            var colVertex = new DataGridViewTextBoxColumn { HeaderText = "Vertex", DataPropertyName = "VertexId", ReadOnly = true, Width = 70 };
+            var colEv = new DataGridViewComboBoxColumn
+            {
+                HeaderText = "Evidence #",
+                DataPropertyName = "EvidenceNo",
+                Width = 180,
+                DisplayStyle = DataGridViewComboBoxDisplayStyle.DropDownButton
+            };
+            var colHeld = new DataGridViewCheckBoxColumn { HeaderText = "Held", DataPropertyName = "Held", Width = 70, ThreeState = false };
+            gridVerts.Columns.AddRange(colVertex, colEv, colHeld);
+
+            gridVerts.CurrentCellDirtyStateChanged += (s, e) =>
+            {
+                if (gridVerts.IsCurrentCellDirty) gridVerts.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+
+            gridVerts.CellValueChanged += (s, e) =>
+            {
+                // If user picks an evidence #, set Held default to that evidence's current Held value
+                if (e.RowIndex >= 0 && e.ColumnIndex == 1 && e.RowIndex < verts.Count)
+                {
+                    var vm = verts[e.RowIndex];
+                    var ep = GetEvidenceByNo(vm.EvidenceNo);
+                    if (ep != null)
+                    {
+                        vm.Held = ep.Held; // copy default; user can still change
+                        gridVerts.InvalidateRow(e.RowIndex);
+                    }
+                }
+            };
+
+            // Bottom panel (CSF + summary + buttons)
+            var bottom = new Panel { Left = 10, Top = 540, Width = 970, Height = 70, Parent = this };
+            var lblCsf = new Label { Text = "CSF:", Left = 10, Top = 8, AutoSize = true, Parent = bottom };
+            txtCsf.Parent = bottom; txtCsf.Left = 50; txtCsf.Top = 5;
+            chkApplyCsf.Parent = bottom; chkApplyCsf.Left = 140; chkApplyCsf.Top = 6; chkApplyCsf.Width = 260;
+            lblSummary.Parent = bottom; lblSummary.Left = 420; lblSummary.Top = 8;
+
+            btnSave.Parent = bottom; btnSave.Left = 680; btnSave.Top = 35; btnSave.Width = 90;
+            btnSaveAdj.Parent = bottom; btnSaveAdj.Left = 780; btnSaveAdj.Top = 35; btnSaveAdj.Width = 110;
+            btnCancel.Parent = bottom; btnCancel.Left = 900; btnCancel.Top = 35; btnCancel.Width = 80;
+
+            // Action buttons
+            btnSave.Click += (s, e) =>
+            {
+                if (SaveAll())
+                {
+                    RunAdjustAfterSave = false;
+                    if (this.Modal) this.DialogResult = DialogResult.OK;
+                    this.Close();
+                }
+            };
+
+            btnSaveAdj.Click += (s, e) =>
+            {
+                if (SaveAll())
+                {
+                    RunAdjustAfterSave = true;
+                    if (!this.Modal)
+                        Commands.RunAlsAdjFromUI();
+                    if (this.Modal) this.DialogResult = DialogResult.OK;
+                    this.Close();
+                }
+            };
+
+            btnCancel.Click += (s, e) =>
+            {
+                if (this.Modal) this.DialogResult = DialogResult.Cancel;
+                this.Close();
+            };
+
+            // Units selector + modeless handlers
+            SetupUnitsUI(bottom);
+            WireModelessMode();
+
+            // add groups to form
+            this.Controls.Add(left);
+            this.Controls.Add(right);
+
+            // Load existing data if available
+            LoadEvidence();
+            LoadPlanIfAny();
+            WireEvidenceComboColumn();
+            RebuildVertexList(preserve: false);
+            UpdateSummary();
+        }
+
+        private void RefreshLegNumbersAndEnds()
+        {
+            // (#, From, To) are derived
+            for (int i = 0; i < gridLegs.Rows.Count; i++)
+            {
+                var r = gridLegs.Rows[i];
+                r.Cells[0].Value = (i + 1).ToString();
+                r.Cells[1].Value = $"P{i + 1}";
+                r.Cells[2].Value = $"P{i + 2}";
+            }
+            UpdateSummary();
+        }
+
+        private void UpdateSummary()
+        {
+            // perimeter and open-closure preview in the current input units
+            double sum = 0, sx = 0, sy = 0;
+            for (int i = 0; i < legs.Count; i++)
+            {
+                var row = legs[i];
+                sum += Math.Max(0, row.Distance);
+                if (BearingParserEx.TryParseToAzimuthRad(row.Bearing, out double az))
+                {
+                    sx += row.Distance * Math.Cos(az);
+                    sy += row.Distance * Math.Sin(az);
+                }
+            }
+            double closure = Math.Sqrt(sx * sx + sy * sy);
+            int lockedCount = legs.Count(l => l.Locked);
+            lblSummary.Text = $"Legs: {legs.Count} (locked: {lockedCount})   Perimeter (raw): {sum:0.###} {UnitAbbrev(currentUnits)}   Open-closure: {closure:0.###} {UnitAbbrev(currentUnits)}";
+        }
+
+        private void ComputeClosingLeg()
+        {
+            // based on current rows; add a leg to close back to P1
+            double sx = 0, sy = 0;
+            for (int i = 0; i < legs.Count; i++)
+            {
+                var row = legs[i];
+                if (!BearingParserEx.TryParseToAzimuthRad(row.Bearing, out double az)) { MessageBox.Show($"Invalid bearing on leg {i + 1}."); return; }
+                if (!(row.Distance > 0)) { MessageBox.Show($"Invalid distance on leg {i + 1}."); return; }
+                sx += row.Distance * Math.Cos(az);
+                sy += row.Distance * Math.Sin(az);
+            }
+            double dx = -sx, dy = -sy;
+            double dist = Math.Sqrt(dx * dx + dy * dy);
+            double azClose = Math.Atan2(dy, dx);
+            if (azClose < 0) azClose += 2 * Math.PI;
+            string btxt = Cad.FormatBearing(azClose);
+            legs.Add(new CogoLegRow { Bearing = btxt, Distance = dist, Locked = false }); // closing leg starts unlocked
+            RefreshLegNumbersAndEnds();
+        }
+
+        private void LoadEvidence()
+        {
+            string evPath = Config.EvidenceJsonPath();
+            if (File.Exists(evPath))
+            {
+                links = Json.Load<EvidenceLinks>(evPath) ?? new EvidenceLinks();
+
+                // Always sync coordinates to current DWG state (handles grid/ground scale toggles)
+                Cad.RefreshEvidencePositionsFromDwg(links);
+                Json.Save(evPath, links);
+            }
+
+            // build combo list…
+            evidenceOptions = new List<ComboItem> { new ComboItem { Index = 0, Label = "(none)" } };
+            for (int i = 0; i < links.Points.Count; i++)
+            {
+                var p = links.Points[i];
+                string tag = $"#{i + 1}";
+                if (!string.IsNullOrWhiteSpace(p.EvidenceType)) tag += $" {p.EvidenceType}";
+                evidenceOptions.Add(new ComboItem { Index = i + 1, Label = tag });
+            }
+        }
+
+        private EvidencePoint GetEvidenceByNo(int no)
+            => (no >= 1 && no <= links.Points.Count) ? links.Points[no - 1] : null;
+
+        private void WireEvidenceComboColumn()
+        {
+            if (gridVerts.Columns.Count < 2) return;
+            if (gridVerts.Columns[1] is DataGridViewComboBoxColumn c)
+            {
+                c.DataSource = evidenceOptions;
+                c.ValueMember = "Index";
+                c.DisplayMember = "Label";
+            }
+        }
+
+        private void LoadPlanIfAny()
+        {
+            string planPath = Config.PlanJsonPath();
+            if (!File.Exists(planPath)) return;
+
+            var plan = Json.Load<PlanData>(planPath);
+            // Fill legs from existing edges (use formatted quadrant text); convert from metres to current units for display
+            legs.Clear();
+
+            // Determine metres -> currentUnits factor for display
+            double m2u = 1.0 / UnitToMeters(currentUnits);
+
+            for (int i = 0; i < plan.Edges.Count; i++)
+            {
+                var e = plan.EdgeAt(i);
+                legs.Add(new CogoLegRow
+                {
+                    Bearing = Cad.FormatBearing(e.BearingRad),
+                    Distance = e.Distance * m2u,
+                    Locked = e.Locked
+                });
+            }
+            txtCsf.Text = plan.CombinedScaleFactor.ToString("0.######", CultureInfo.InvariantCulture);
+            RefreshLegNumbersAndEnds();
+
+            // Seed vertex → evidence mapping from existing EvidenceLinks (PlanId field)
+            var idToEvidenceNo = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < links.Points.Count; i++)
+            {
+                var p = links.Points[i];
+                if (!string.IsNullOrWhiteSpace(p.PlanId)) idToEvidenceNo[p.PlanId] = i + 1;
+            }
+
+            verts.Clear();
+            int vcount = Math.Max(1, legs.Count + 1);
+            for (int i = 0; i < vcount; i++)
+            {
+                string vid = $"P{i + 1}";
+                int eno = idToEvidenceNo.TryGetValue(vid, out var k) ? k : 0;
+                bool held = false;
+                var ep = GetEvidenceByNo(eno); if (ep != null) held = ep.Held;
+                verts.Add(new VertexMapRow { VertexId = vid, EvidenceNo = eno, Held = held });
+            }
+        }
+
+        private void RebuildVertexList(bool preserve)
+        {
+            var old = verts.ToDictionary(v => v.VertexId, v => v);
+            verts.Clear();
+            int vcount = Math.Max(1, legs.Count + 1);
+            for (int i = 0; i < vcount; i++)
+            {
+                string vid = $"P{i + 1}";
+                if (preserve && old.TryGetValue(vid, out var o))
+                    verts.Add(new VertexMapRow { VertexId = vid, EvidenceNo = o.EvidenceNo, Held = o.Held });
+                else
+                    verts.Add(new VertexMapRow { VertexId = vid, EvidenceNo = 0, Held = false });
+            }
+        }
+
+        // DataGrid configuration + Delete key support
+        private void ConfigureLegsGrid()
+        {
+            gridLegs.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            gridLegs.MultiSelect = true;
+
+            foreach (DataGridViewColumn col in gridLegs.Columns)
+                col.SortMode = DataGridViewColumnSortMode.NotSortable;
+
+            gridLegs.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Delete)
+                {
+                    DeleteSelectedLegs(s, EventArgs.Empty);
+                    e.Handled = true;
+                }
+            };
+        }
+
+        private void DeleteSelectedLegs(object? sender, EventArgs e)
+        {
+            gridLegs.EndEdit();
+
+            var toRemove = new HashSet<CogoLegRow>();
+
+            foreach (DataGridViewRow r in gridLegs.SelectedRows)
+                if (!r.IsNewRow && r.DataBoundItem is CogoLegRow rowObj)
+                    toRemove.Add(rowObj);
+
+            if (toRemove.Count == 0)
+            {
+                foreach (DataGridViewCell c in gridLegs.SelectedCells)
+                    if (!c.OwningRow.IsNewRow && c.OwningRow.DataBoundItem is CogoLegRow rowObj)
+                        toRemove.Add(rowObj);
+            }
+
+            if (toRemove.Count == 0 &&
+                gridLegs.CurrentRow != null &&
+                !gridLegs.CurrentRow.IsNewRow &&
+                gridLegs.CurrentRow.DataBoundItem is CogoLegRow curObj)
+            {
+                toRemove.Add(curObj);
+            }
+
+            if (toRemove.Count == 0) return;
+
+            foreach (var r in toRemove)
+                legs.Remove(r);
+
+            RefreshLegNumbersAndEnds();
+            RebuildVertexList(preserve: true);
+        }
+
+        // Build a PlanData directly from the grid, preserving the Locked flags
+        private bool TryBuildPlan(out PlanData plan, out double closureLen)
+        {
+            plan = null; closureLen = 0;
+
+            // parse CSF
+            double csf = 1.0;
+            if (!double.TryParse(txtCsf.Text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out csf) || csf <= 0.5 || csf >= 1.5)
+            {
+                MessageBox.Show("Invalid CSF. Enter a value between 0.5 and 1.5.");
+                return false;
+            }
+
+            double u2m = UnitToMeters(currentUnits); // convert from selected input units to metres
+
+            // Build plan with Locked flags preserved
+            plan = new PlanData { CombinedScaleFactor = csf };
+            var cur = new Point2d(0, 0);
+            plan.VertexIds.Add("P1");
+            plan.VertexXY.Add(new XY(cur.X, cur.Y));
+
+            for (int i = 0; i < legs.Count; i++)
+            {
+                var r = legs[i];
+                if (!BearingParserEx.TryParseToAzimuthRad(r.Bearing, out double az))
+                {
+                    MessageBox.Show($"Invalid bearing on leg {i + 1}: \"{r.Bearing}\"");
+                    plan = null; return false;
+                }
+                if (!(r.Distance > 0))
+                {
+                    MessageBox.Show($"Invalid distance on leg {i + 1}.");
+                    plan = null; return false;
+                }
+
+                // 1) convert entered unit → metres,  2) optionally apply CSF
+                double dMetres = r.Distance * u2m;
+                double dUse = chkApplyCsf.Checked ? dMetres * csf : dMetres;
+
+                string fromId = $"P{i + 1}";
+                string toId = $"P{i + 2}";
+
+                cur = new Point2d(cur.X + dUse * Math.Cos(az), cur.Y + dUse * Math.Sin(az));
+                plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = az, Locked = r.Locked });
+                plan.VertexIds.Add(toId);
+                plan.VertexXY.Add(new XY(cur.X, cur.Y));
+            }
+
+            var first = new Point2d(plan.VertexXY[0].X, plan.VertexXY[0].Y);
+            var lastXY = plan.VertexXY[plan.VertexXY.Count - 1];
+            var last = new Point2d(lastXY.X, lastXY.Y);
+            closureLen = Cad.Distance(first, last);
+            plan.Closed = closureLen < 1e-6;
+            return true;
+        }
+
+        private bool SaveAll()
+        {
+            if (!TryBuildPlan(out var plan, out double closure))
+                return false;
+
+            // Lock while adding entities / writing JSON
+            Cad.WithLockedDoc(() =>
+            {
+                PlanBuild.SaveAndDraw(plan, closure, tag: "COGO-Editor");
+            });
+
+            // Update EvidenceLinks from the grid and save
+            foreach (var p in links.Points) p.PlanId = "";
+            var byNo = new Dictionary<int, EvidencePoint>();
+            for (int i = 0; i < links.Points.Count; i++) byNo[i + 1] = links.Points[i];
+
+            foreach (var v in verts)
+            {
+                if (v.EvidenceNo <= 0) continue;
+                if (!byNo.TryGetValue(v.EvidenceNo, out var ep)) continue;
+                ep.PlanId = v.VertexId;
+                ep.Held = v.Held;
+            }
+
+            Json.Save(Config.EvidenceJsonPath(), links);
+            Cad.Ed.WriteMessage($"\nSaved evidence links: {Config.EvidenceJsonPath()}");
+            return true;
+        }
+
+        // ---------- Units helpers (PlanCogoForm only) ----------
+        private static string UnitAbbrev(InputUnits u)
+            => u == InputUnits.Meters ? "m" : (u == InputUnits.Feet ? "ft" : "ch");
+
+        private static double UnitToMeters(InputUnits u)
+            => u == InputUnits.Meters ? 1.0
+               : (u == InputUnits.Feet ? 0.3048
+               : 20.1168); // 1 chain = 66 ft
+
+        private void UpdateDistanceColumnHeader()
+        {
+            colDist.HeaderText = $"Distance ({UnitAbbrev(currentUnits)})";
+        }
+
+        private void ConvertExistingDistances(InputUnits fromU, InputUnits toU)
+        {
+            if (fromU == toU) return;
+            double f = UnitToMeters(fromU) / UnitToMeters(toU); // scale current numbers to new unit
+            for (int i = 0; i < legs.Count; i++)
+                legs[i].Distance = legs[i].Distance * f;
+
+            gridLegs.Refresh();
+            UpdateSummary();
+        }
+
+        private void SetupUnitsUI(Control bottom)
+        {
+            // Place to the right of CSF options; nudge summary right to make room
+            lblUnits.Parent = bottom; lblUnits.Left = 410; lblUnits.Top = 8;
+            cboUnits.Parent = bottom; cboUnits.Left = lblUnits.Left + 80; cboUnits.Top = 4;
+
+            // Shift summary right if it would overlap
+            if (lblSummary.Left < (cboUnits.Left + cboUnits.Width + 20))
+                lblSummary.Left = cboUnits.Left + cboUnits.Width + 20;
+
+            // Items + default
+            cboUnits.Items.AddRange(new object[] { "m (meters)", "ft (feet)", "ch (chains)" });
+            cboUnits.SelectedIndex = (int)InputUnits.Meters;
+            UpdateDistanceColumnHeader();
+
+            // Handle changes with optional conversion of existing distances
+            cboUnits.SelectedIndexChanged += (s, e) =>
+            {
+                var newU = (InputUnits)cboUnits.SelectedIndex;
+                var oldU = currentUnits;
+                if (newU == oldU) return;
+
+                if (legs.Count > 0)
+                {
+                    var dr = MessageBox.Show(
+                        "Convert existing distances to the new unit?\n\nYes: preserve lengths (values will be rescaled)\nNo: keep numbers (only the unit label changes)",
+                        "Change Input Units",
+                        MessageBoxButtons.YesNoCancel,
+                        MessageBoxIcon.Question);
+
+                    if (dr == DialogResult.Cancel)
+                    {
+                        // revert the combo box if user cancels
+                        cboUnits.SelectedIndex = (int)oldU;
+                        return;
+                    }
+                    if (dr == DialogResult.Yes)
+                        ConvertExistingDistances(oldU, newU);
+                }
+
+                currentUnits = newU;
+                UpdateDistanceColumnHeader();
+                UpdateSummary();
+            };
+        }
+
+        private void WireModelessMode()
+        {
+            // Make keystrokes pass through to grids; Esc closes only when desired
+            this.KeyPreview = true;
+            this.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    btnCancel.PerformClick();
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.F5)
+                {
+                    RebuildVertexList(preserve: true);
+                    e.Handled = true;
+                }
+            };
+
+            // If shown modeless, keep the form easy to find
+            this.TopMost = false;
+            this.ShowInTaskbar = false;
+        }
+    }
+
+    // ---------------------------- Commands: PLANCOGOUI + updated ALSWIZARD ----------------------------
+    public partial class Commands
+    {
+        [CommandMethod("PLANCOGOUI", CommandFlags.Session)]
+        public void PlanCogoUI()
+        {
+            var frm = new PlanCogoForm();
+            AcadApp.ShowModelessDialog(frm);
+        }
+
+        // Wizard: Harvest → COGO UI → ALSADJ (on Save & Adjust)
+        [CommandMethod("ALSWIZARD", CommandFlags.Session)]
+        public void AlsWizard()
+        {
+            var ed = Cad.Ed;
+            ed.WriteMessage("\nALSWIZARD — Harvest → PLANCOGOUI → ALSADJ (on Save & Adjust).");
+
+            // 1) Evidence harvest (blocks only until you finish selection)
+            EvidenceHarvest();
+
+            // 2) Open the editor modeless so you can pan/zoom while it’s open
+            var frm = new PlanCogoForm();
+            AcadApp.ShowModelessDialog(frm);
+
+            ed.WriteMessage("\nCOGO editor opened modeless. Use Save to write JSON; Save & Adjust to run ALSADJ.");
+        }
+    }
+
     internal static class Json
     {
         static readonly JsonSerializerOptions Opt = new JsonSerializerOptions
         {
             WriteIndented = false,
             PropertyNamingPolicy = null,
-            IncludeFields = true   // <-- add this
+            IncludeFields = true
         };
 
         public static void Save<T>(string path, T obj)
@@ -79,6 +691,37 @@ namespace SurveyCalculator
     {
         public static Editor Ed => AcadApp.DocumentManager.MdiActiveDocument.Editor;
         public static Database Db => HostApplicationServices.WorkingDatabase;
+        public static void RefreshEvidencePositionsFromDwg(EvidenceLinks links)
+        {
+            if (links?.Points == null || links.Points.Count == 0) return;
+
+            using var tr = Db.TransactionManager.StartTransaction();
+            foreach (var p in links.Points)
+            {
+                if (string.IsNullOrWhiteSpace(p.Handle)) continue;
+
+                try
+                {
+                    long hval = Convert.ToInt64(p.Handle, 16);
+                    var h = new Handle(hval);
+                    ObjectId id = Db.GetObjectId(false, h, 0);
+                    if (!id.IsNull && id.IsValid)
+                    {
+                        if (tr.GetObject(id, OpenMode.ForRead, false) is BlockReference br)
+                        {
+                            p.X = br.Position.X;
+                            p.Y = br.Position.Y;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Handle not found / entity erased / xref, etc. — ignore safely
+                }
+            }
+            tr.Commit();
+        }
+
         public static bool UnlockIfLocked(string layerName)
         {
             bool wasLocked = false;
@@ -96,6 +739,16 @@ namespace SurveyCalculator
             }
             tr.Commit();
             return wasLocked;
+        }
+
+        public static void WithLockedDoc(Action action)
+        {
+            var doc = AcadApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) { action(); return; }
+            using (doc.LockDocument())
+            {
+                action();
+            }
         }
 
         public static ObjectId EnsureLayer(string name, short aci = 7, bool lockAfter = false)
@@ -151,7 +804,6 @@ namespace SurveyCalculator
                 ? Ed.GetSelection(opts, new SelectionFilter(filter))
                 : Ed.GetSelection(opts);
         }
-        // Replace the old 1‑arg GetPoint with this:
         public static PromptPointResult GetPoint(string msg, bool allowNone = false)
         {
             var opts = new PromptPointOptions("\n" + msg + ": ")
@@ -177,10 +829,19 @@ namespace SurveyCalculator
     }
 
     // ---------------------------- Data Models ----------------------------
-    [Serializable] public class XY { public double X; public double Y; public XY() { } public XY(double x, double y){X=x;Y=y;} }
+    [Serializable] public class XY { public double X; public double Y; public XY() { } public XY(double x, double y) { X = x; Y = y; } }
 
     [Serializable]
-    public class PlanEdge { public string FromId; public string ToId; public double Distance; public double BearingRad; }
+    public class PlanEdge
+    {
+        public string FromId;
+        public string ToId;
+        public double Distance;
+        public double BearingRad;
+
+        // keep this leg’s length fixed during between-held proportioning (e.g., statutory road width)
+        public bool Locked;
+    }
 
     [Serializable]
     public class PlanData
@@ -214,17 +875,17 @@ namespace SurveyCalculator
     // ---------------------------- Parsing ----------------------------
     internal static class BearingParserEx
     {
-        // Quadrant bearing: N dd°mm'ss.s" E     (spacing/symbols flexible: D or °; ' or ’; " or ”)
+        // Quadrant bearing: N dd°mm'ss.s" E
         static readonly Regex Quad = new Regex(
             @"^\s*([NS])\s*([0-9]{1,3})\s*(?:[D°])\s*([0-9]{1,2})?\s*['’]?\s*([0-9]{1,2}(?:\.\d+)?)?\s*[""”]?\s*([EW])\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-        // Azimuth from north, clockwise:  [AZ] dd°mm'ss.s"     (e.g., 45D04'30")
+        // Azimuth from north, clockwise: DMS
         static readonly Regex AzDms = new Regex(
             @"^\s*(?:AZ\s*)?([0-9]{1,3})\s*(?:[D°])\s*([0-9]{1,2})?\s*['’]?\s*([0-9]{1,2}(?:\.\d+)?)?\s*[""”]?\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-        // Azimuth from north, clockwise: decimal degrees (e.g., 123.5 or AZ 123.5°)
+        // Azimuth from north, clockwise: decimal degrees
         static readonly Regex AzDec = new Regex(
             @"^\s*(?:AZ\s*)?([0-9]+(?:\.[0-9]+)?)\s*(?:[D°])?\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -240,24 +901,24 @@ namespace SurveyCalculator
             if (mq.Success)
             {
                 bool north = char.ToUpperInvariant(mq.Groups[1].Value[0]) == 'N';
-                bool east  = char.ToUpperInvariant(mq.Groups[5].Value[0]) == 'E';
+                bool east = char.ToUpperInvariant(mq.Groups[5].Value[0]) == 'E';
                 int d = int.Parse(mq.Groups[2].Value, CultureInfo.InvariantCulture);
                 int m = string.IsNullOrEmpty(mq.Groups[3].Value) ? 0 : int.Parse(mq.Groups[3].Value, CultureInfo.InvariantCulture);
                 double s = string.IsNullOrEmpty(mq.Groups[4].Value) ? 0 : double.Parse(mq.Groups[4].Value, CultureInfo.InvariantCulture);
 
-                double theta = (d + m/60.0 + s/3600.0) * Math.PI / 180.0; // away from N/S toward E/W
+                double theta = (d + m / 60.0 + s / 3600.0) * Math.PI / 180.0; // away from N/S toward E/W
 
                 // Convert quadrant -> azimuth-from-north (clockwise)
                 double azN = 0;
-                if (north && east)  azN = theta;                 // NE
-                if (north && !east) azN = 2*Math.PI - theta;     // NW
-                if (!north && east) azN = Math.PI - theta;       // SE
-                if (!north && !east)azN = Math.PI + theta;       // SW
+                if (north && east) azN = theta;                 // NE
+                if (north && !east) azN = 2 * Math.PI - theta;  // NW
+                if (!north && east) azN = Math.PI - theta;      // SE
+                if (!north && !east) azN = Math.PI + theta;     // SW
 
                 // Our math frame: 0 along +X (east), CCW
-                azEastRad = (Math.PI/2) - azN;
-                while (azEastRad < 0) azEastRad += 2*Math.PI;
-                while (azEastRad >= 2*Math.PI) azEastRad -= 2*Math.PI;
+                azEastRad = (Math.PI / 2) - azN;
+                while (azEastRad < 0) azEastRad += 2 * Math.PI;
+                while (azEastRad >= 2 * Math.PI) azEastRad -= 2 * Math.PI;
                 return true;
             }
 
@@ -268,12 +929,12 @@ namespace SurveyCalculator
                 int d = int.Parse(md.Groups[1].Value, CultureInfo.InvariantCulture);
                 int m = string.IsNullOrEmpty(md.Groups[2].Value) ? 0 : int.Parse(md.Groups[2].Value, CultureInfo.InvariantCulture);
                 double s = string.IsNullOrEmpty(md.Groups[3].Value) ? 0 : double.Parse(md.Groups[3].Value, CultureInfo.InvariantCulture);
-                double deg = d + m/60.0 + s/3600.0;
+                double deg = d + m / 60.0 + s / 3600.0;
                 double azN = deg * Math.PI / 180.0;
 
-                azEastRad = (Math.PI/2) - azN;
-                while (azEastRad < 0) azEastRad += 2*Math.PI;
-                while (azEastRad >= 2*Math.PI) azEastRad -= 2*Math.PI;
+                azEastRad = (Math.PI / 2) - azN;
+                while (azEastRad < 0) azEastRad += 2 * Math.PI;
+                while (azEastRad >= 2 * Math.PI) azEastRad -= 2 * Math.PI;
                 return true;
             }
 
@@ -284,15 +945,15 @@ namespace SurveyCalculator
                 double deg = double.Parse(mz.Groups[1].Value, CultureInfo.InvariantCulture);
                 double azN = deg * Math.PI / 180.0;
 
-                azEastRad = (Math.PI/2) - azN;
-                while (azEastRad < 0) azEastRad += 2*Math.PI;
-                while (azEastRad >= 2*Math.PI) azEastRad -= 2*Math.PI;
+                azEastRad = (Math.PI / 2) - azN;
+                while (azEastRad < 0) azEastRad += 2 * Math.PI;
+                while (azEastRad >= 2 * Math.PI) azEastRad -= 2 * Math.PI;
                 return true;
             }
             return false;
         }
 
-        // Convenience: parse one-line "bearing distance" like:  N45°04'30"E 550.50  OR  45D04'30" 550.50  OR with a comma
+        // Convenience: parse one-line "bearing distance"
         static readonly Regex BearingDistLine = new Regex(@"^\s*(?<b>.+?)\s*(?:,|\s)\s*(?<d>[+-]?\d+(?:\.\d+)?)\s*$", RegexOptions.Compiled);
         public static bool TryParseBearingAndDistance(string line, out double azEast, out double dist)
         {
@@ -314,16 +975,16 @@ namespace SurveyCalculator
             k = 1; c = 1; s = 0; t = new Vector2d(0, 0);
             if (pairs == null || pairs.Count < 2) return false;
             double W = 0, axs = 0, ays = 0, bxs = 0, bys = 0;
-            foreach (var (a, b, w) in pairs){ W += w; axs += w * a.X; ays += w * a.Y; bxs += w * b.X; bys += w * b.Y; }
+            foreach (var (a, b, w) in pairs) { W += w; axs += w * a.X; ays += w * a.Y; bxs += w * b.X; bys += w * b.Y; }
             var ca = new Point2d(axs / W, ays / W); var cb = new Point2d(bxs / W, bys / W);
 
-            double Sxx=0,Sxy=0,Syx=0,Syy=0,S1=0;
+            double Sxx = 0, Sxy = 0, Syx = 0, Syy = 0, S1 = 0;
             foreach (var (a, b, w) in pairs)
             {
                 var A = a - ca; var B = b - cb;
                 Sxx += w * A.X * B.X; Sxy += w * A.X * B.Y;
                 Syx += w * A.Y * B.X; Syy += w * A.Y * B.Y;
-                S1  += w * (A.X * A.X + A.Y * A.Y);
+                S1 += w * (A.X * A.X + A.Y * A.Y);
             }
             double A1 = Sxx + Syy; double B1 = Sxy - Syx; double norm = Math.Sqrt(A1 * A1 + B1 * B1);
             if (norm < 1e-12) return false;
@@ -349,31 +1010,6 @@ namespace SurveyCalculator
 
     internal static class TraverseSolver
     {
-        // Compass‑rule closure along a segment chain
-        public static List<Point2d> DriveBetween(Point2d startHeld, Point2d endHeld,
-            IReadOnlyList<PlanEdge> chain, double closureTol, out double closure)
-        {
-            var raw = new List<Point2d> { startHeld };
-            var deltas = new List<Vector2d>(); double sumL = 0;
-            foreach (var e in chain)
-            {
-                double dx = e.Distance * Math.Cos(e.BearingRad);
-                double dy = e.Distance * Math.Sin(e.BearingRad);
-                deltas.Add(new Vector2d(dx, dy)); sumL += e.Distance;
-                raw.Add(new Point2d(raw[raw.Count - 1].X + dx, raw[raw.Count - 1].Y + dy));
-            }
-            double Cx = endHeld.X - raw[raw.Count - 1].X; double Cy = endHeld.Y - raw[raw.Count - 1].Y;
-            closure = Math.Sqrt(Cx * Cx + Cy * Cy);
-            var closed = new List<Point2d> { startHeld };
-            for (int i = 0; i < deltas.Count; i++)
-            {
-                double f = chain[i].Distance / sumL;
-                var adj = new Vector2d(deltas[i].X + f * Cx, deltas[i].Y + f * Cy);
-                closed.Add(new Point2d(closed[closed.Count - 1].X + adj.X, closed[closed.Count - 1].Y + adj.Y));
-            }
-            return closed;
-        }
-
         // Forward integrate a chain from a single held point (no closure).
         public static List<Point2d> DriveOpenFrom(Point2d startHeld, IReadOnlyList<PlanEdge> chain)
         {
@@ -390,7 +1026,7 @@ namespace SurveyCalculator
         }
     }
 
-    internal enum SolveTag { Held, BearingDistance, BearingIntersection, Proportion, CompassTraverse, SimilarityBetween }
+    internal enum SolveTag { Held, BearingDistance, BearingIntersection, Proportion, CompassTraverse, SimilarityBetween, SimilarityBetweenLocked }
 
     internal static class PlanBuild
     {
@@ -406,15 +1042,16 @@ namespace SurveyCalculator
                 var (L, az) = edges[i];
                 var next = new Point2d(cur.X + L * Math.Cos(az), cur.Y + L * Math.Sin(az));
                 string fromId = $"P{i + 1}";
-                string toId   = $"P{i + 2}";
-                plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = L, BearingRad = az });
+                string toId = $"P{i + 2}";
+                plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = L, BearingRad = az, Locked = false });
                 plan.VertexIds.Add(toId);
                 plan.VertexXY.Add(new XY(next.X, next.Y));
                 cur = next;
             }
 
             var first = new Point2d(plan.VertexXY[0].X, plan.VertexXY[0].Y);
-            var last  = new Point2d(plan.VertexXY[^1].X, plan.VertexXY[^1].Y);
+            var lastXY = plan.VertexXY[plan.VertexXY.Count - 1];
+            var last = new Point2d(lastXY.X, lastXY.Y);
             closureLen = Cad.Distance(first, last);
             plan.Closed = closureLen < 1e-6;
             return plan;
@@ -447,7 +1084,6 @@ namespace SurveyCalculator
     }
 
     // ---------------------------- EVILINK Form ----------------------------
-    // ---------------------------- EVILINK Form ----------------------------
     public class EvilinkForm : Form
     {
         public EvidenceLinks Links { get; private set; }
@@ -460,20 +1096,26 @@ namespace SurveyCalculator
         public EvilinkForm(EvidenceLinks links)
         {
             this.Text = "Evidence ↔ Plan Linker (EVILINK)";
-            this.Width = 820;
-            this.Height = 520;
+            this.Width = 860;
+            this.Height = 540;
             this.StartPosition = FormStartPosition.CenterScreen;
 
             Links = links ?? new EvidenceLinks();
 
             grid.Dock = DockStyle.Top;
-            grid.Height = 400;
+            grid.Height = 420;
             grid.AutoGenerateColumns = false;
             grid.AllowUserToAddRows = false;
             grid.AllowUserToDeleteRows = false;
+            grid.AllowUserToOrderColumns = false;
+            grid.RowHeadersVisible = false;
             grid.DataSource = Links.Points;
 
-            // Columns
+            // # column (unbound, read-only; reflects list order 1..N)
+            var colNo = new DataGridViewTextBoxColumn { HeaderText = "#", ReadOnly = true, Width = 48 };
+            grid.Columns.Add(colNo);
+
+            // Handle (read-only)
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Handle", DataPropertyName = "Handle", ReadOnly = true, Width = 120 });
 
             var colX = new DataGridViewTextBoxColumn { HeaderText = "X", DataPropertyName = "X", ReadOnly = true, Width = 120 };
@@ -486,29 +1128,42 @@ namespace SurveyCalculator
             colY.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
             grid.Columns.Add(colY);
 
-            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "PlanID (P#)", DataPropertyName = "PlanId", Width = 100 });
+            // Editable columns
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "PlanID (P#)", DataPropertyName = "PlanId", Width = 110 });
             grid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "Held", DataPropertyName = "Held", Width = 60 });
+
+            // Read-only info columns
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "EvidenceType (block)", DataPropertyName = "EvidenceType", ReadOnly = true, Width = 180 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Priority", DataPropertyName = "Priority", Width = 60 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Priority", DataPropertyName = "Priority", Width = 70 });
+
+            // Backfill the # column from the data order each time the grid binds
+            grid.DataBindingComplete += (s, e) =>
+            {
+                for (int i = 0; i < Links.Points.Count && i < grid.Rows.Count; i++)
+                    grid.Rows[i].Cells[0].Value = (i + 1).ToString();
+            };
 
             // Buttons
             btnSave.Text = "Save";
-            btnSave.Width = 100;
-            btnSave.Top = 430;
-            btnSave.Left = 600;
+            btnSave.Width = 110;
+            btnSave.Top = 450;
+            btnSave.Left = this.Width - 270;
+            btnSave.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             btnSave.Click += (s, e) => { this.DialogResult = DialogResult.OK; this.Close(); };
 
             btnCancel.Text = "Cancel";
-            btnCancel.Width = 100;
-            btnCancel.Top = 430;
-            btnCancel.Left = 710;
+            btnCancel.Width = 110;
+            btnCancel.Top = 450;
+            btnCancel.Left = this.Width - 150;
+            btnCancel.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             btnCancel.Click += (s, e) => { this.DialogResult = DialogResult.Cancel; this.Close(); };
 
             // Tip label
-            lbl.Text = "Tip: If you used PLANCOGO or PLANFROMTEXT, PlanIDs won’t auto‑snap; assign them manually. FDI auto‑Held, fdspike not held by default.";
-            lbl.Top = 405;
+            lbl.Text = "Tip: Use the #s shown on-screen and in the drawing labels to assign PlanIDs (P1, P2, ...).";
+            lbl.Top = 425;
             lbl.Left = 10;
-            lbl.Width = 560;
+            lbl.Width = this.Width - 320;
+            lbl.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
             // Compose
             this.Controls.Add(grid);
@@ -519,7 +1174,7 @@ namespace SurveyCalculator
     }
 
     // ---------------------------- Commands ----------------------------
-    public class Commands
+    public partial class Commands
     {
         // ---------- small math helpers ----------
         static double Normalize(double a)
@@ -596,20 +1251,21 @@ namespace SurveyCalculator
                 }
             }
         }
+
         [CommandMethod("EVIHARVEST")]
         public void EvidenceHarvest()
         {
             var ed = Cad.Ed;
-            ed.WriteMessage("\nEVIHARVEST — select evidence blocks, whitelist filter, auto-number, label, and save links.");
+            ed.WriteMessage("\nEVIHARVEST — select evidence blocks, whitelist filter, number, label, and save.");
 
-            // --- Defaults (case-insensitive) ---
+            // Default whitelist (case-insensitive)
             var defaultNames = new[]
             {
-        "PLI","plhub","plspike","PLIBAR","FDI","TEMP","fdhub","FDIBAR","fdspike","WITF"
-    };
+                "PLI","plhub","plspike","PLIBAR","FDI","TEMP","fdhub","FDIBAR","fdspike","WITF"
+            };
             var allowed = new HashSet<string>(defaultNames, StringComparer.OrdinalIgnoreCase);
 
-            // Persisted whitelist (per drawing folder)
+            // Persisted whitelist next to DWG
             string wlPath = Path.Combine(Config.CurrentDwgFolder(), $"{Config.Stem()}_BlockWhitelist.json");
             try
             {
@@ -619,75 +1275,65 @@ namespace SurveyCalculator
                     foreach (var n in persisted) if (!string.IsNullOrWhiteSpace(n)) allowed.Add(n.Trim());
                 }
             }
-            catch { /* ignore read problems */ }
+            catch { /* ignore */ }
 
-            // Optional extras this run (also persisted)
+            // Optional extras this run (persist them)
             var addOpt = new PromptStringOptions("\nAdditional block names to recognize (comma-separated, Enter for none): ")
             { AllowSpaces = true };
             var addRes = ed.GetString(addOpt);
-            var extras = new List<string>();
+            var addedNames = new List<string>();
             if (addRes.Status == PromptStatus.OK && !string.IsNullOrWhiteSpace(addRes.StringResult))
             {
                 foreach (var raw in addRes.StringResult.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
                 {
                     var n = raw.Trim();
                     if (n.Length == 0) continue;
-                    if (allowed.Add(n)) extras.Add(n);
+                    if (allowed.Add(n)) addedNames.Add(n);
                 }
-            }
-            if (extras.Count > 0)
-            {
-                // merge + persist
-                var merged = new HashSet<string>(allowed, StringComparer.OrdinalIgnoreCase);
-                Json.Save(wlPath, merged.ToList());
-                ed.WriteMessage($"\nWhitelist updated: {wlPath}");
+                if (addedNames.Count > 0) Json.Save(wlPath, allowed.ToList());
             }
 
-            // User selection (avoids detail blocks elsewhere)
+            // User selection (prevents pulling detail symbols elsewhere)
             var psr = Cad.PromptSelect("Select evidence blocks (window/crossing recommended)",
                 new TypedValue((int)DxfCode.Start, "INSERT"));
             if (psr.Status != PromptStatus.OK) return;
 
-            // Load existing links (so we don't duplicate by handle)
-            EvidenceLinks links;
+            // Load existing JSON (so we can append and keep # stable)
             string evPath = Config.EvidenceJsonPath();
-            if (File.Exists(evPath)) links = Json.Load<EvidenceLinks>(evPath) ?? new EvidenceLinks();
-            else links = new EvidenceLinks();
+            EvidenceLinks links = File.Exists(evPath) ? (Json.Load<EvidenceLinks>(evPath) ?? new EvidenceLinks())
+                                                      : new EvidenceLinks();
 
             var byHandle = new Dictionary<string, EvidencePoint>(StringComparer.OrdinalIgnoreCase);
             foreach (var p in links.Points) if (!string.IsNullOrEmpty(p.Handle)) byHandle[p.Handle] = p;
 
             const string LabelLayer = "EVIDENCE_TAGS";
-            const double LabelHeight = 5.0; // requested 5
-            Cad.EnsureLayer(LabelLayer, aci: 2 /* yellow-ish */);
+            const double LabelHeight = 5.0;
+            Cad.EnsureLayer(LabelLayer, aci: 2);
 
             int added = 0, labeled = 0;
 
             using (var tr = Cad.Db.TransactionManager.StartTransaction())
             {
-                var bt = (BlockTable)tr.GetObject(Cad.Db.BlockTableId, OpenMode.ForRead);
-                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+                var ms = (BlockTableRecord)tr.GetObject(
+                    ((BlockTable)tr.GetObject(Cad.Db.BlockTableId, OpenMode.ForRead))[BlockTableRecord.ModelSpace],
+                    OpenMode.ForWrite);
 
-                // helper: check if a label already exists near a point
-                bool HasLabelNear(Transaction t, string layer, string text, Point2d p, double tol)
+                // Helper: detect if a "#n" label is already near a point (avoid duplicates)
+                bool HasLabelNear(string text, Point2d p, double tol)
                 {
                     double tol2 = tol * tol;
                     foreach (ObjectId eid in ms)
                     {
-                        var e = t.GetObject(eid, OpenMode.ForRead) as Entity;
-                        if (e is not DBText dt) continue;
-                        if (!string.Equals(e.Layer, layer, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (tr.GetObject(eid, OpenMode.ForRead) is not DBText dt) continue;
+                        if (!string.Equals(dt.Layer, LabelLayer, StringComparison.OrdinalIgnoreCase)) continue;
                         if (!string.Equals((dt.TextString ?? "").Trim(), text, StringComparison.Ordinal)) continue;
-
-                        // use AlignmentPoint if set, else Position
-                        var pos3 = (dt.AlignmentPoint.IsEqualTo(Point3d.Origin)) ? dt.Position : dt.AlignmentPoint;
+                        var pos3 = dt.AlignmentPoint.IsEqualTo(Point3d.Origin) ? dt.Position : dt.AlignmentPoint;
                         double dx = pos3.X - p.X, dy = pos3.Y - p.Y;
                         if (dx * dx + dy * dy <= tol2) return true;
                     }
                     return false;
                 }
 
-                // We number by order in JSON: index+1. New items append, so existing numbers stay stable.
                 foreach (var id in psr.Value.GetObjectIds())
                 {
                     var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
@@ -699,7 +1345,6 @@ namespace SurveyCalculator
                     string h = br.Handle.ToString();
                     if (!byHandle.TryGetValue(h, out var ep))
                     {
-                        // New evidence point
                         bool strong = string.Equals(bname, "FDI", StringComparison.OrdinalIgnoreCase);
                         bool weak = string.Equals(bname, "fdspike", StringComparison.OrdinalIgnoreCase);
 
@@ -710,22 +1355,21 @@ namespace SurveyCalculator
                             X = br.Position.X,
                             Y = br.Position.Y,
                             EvidenceType = bname,
-                            Held = strong,
+                            Held = strong,                       // default Held for FDI
                             Priority = strong ? 2 : (weak ? 0 : 1)
                         };
-                        links.Points.Add(ep);
+                        links.Points.Add(ep);                   // append -> stable numbering
                         byHandle[h] = ep;
                         added++;
                     }
 
-                    // Determine its stable number (# = 1-based index in the JSON list)
+                    // Number is 1-based index in the list
                     int num = links.Points.FindIndex(p => string.Equals(p.Handle, h, StringComparison.OrdinalIgnoreCase)) + 1;
                     if (num <= 0) num = 1;
 
-                    // Label at the insert point if not already there
-                    var p2 = new Point2d(br.Position.X, br.Position.Y);
+                    var p2 = new Point2d(ep.X, ep.Y);
                     string labelText = $"#{num}";
-                    if (!HasLabelNear(tr, LabelLayer, labelText, p2, tol: LabelHeight * 0.35))
+                    if (!HasLabelNear(labelText, p2, tol: LabelHeight * 0.35))
                     {
                         var txt = new DBText
                         {
@@ -748,44 +1392,16 @@ namespace SurveyCalculator
 
             Json.Save(evPath, links);
             ed.WriteMessage($"\nHarvested {added} new evidence; labeled {labeled}. Saved: {evPath}\n" +
-                            $"Open EVILINK to pick Held + assign PlanIDs when ready.");
+                            "Run EVILINK (table) to assign PlanIDs and Held.");
         }
-        [CommandMethod("ALSWIZARD")]
-        public void AlsWizard()
+
+        // in Commands (make it callable from UI if you ever want)
+        public static void RunAlsAdjFromUI()
         {
-            var ed = Cad.Ed;
-            ed.WriteMessage("\nALSWIZARD — COGO (if needed) → EVIHARVEST → EVILINK → ALSADJ.");
-
-            // Ensure we have a plan JSON
-            string planPath = Config.PlanJsonPath();
-            if (!File.Exists(planPath))
-            {
-                var k = new PromptKeywordOptions("\nNo plan found. Build one now with PLANCOGO? [Yes/No] <Yes>: ");
-                k.Keywords.Add("Yes"); k.Keywords.Add("No"); k.AllowNone = true;
-                var r = ed.GetKeywords(k);
-                bool go = !(r.Status == PromptStatus.OK && r.StringResult == "No");
-                if (!go) { ed.WriteMessage("\nNeed a plan to continue."); return; }
-
-                // Launch your existing COGO builder
-                PlanCogo();
-
-                if (!File.Exists(planPath))
-                {
-                    ed.WriteMessage("\nPLANCOGO was cancelled. Exiting.");
-                    return;
-                }
-            }
-
-            // 1) Harvest & label evidence (user window-selects and we number/label)
-            EvidenceHarvest();
-
-            // 2) Open the table so the user can set Held + PlanID (P#)
-            Evilink();
-
-            // 3) Auto-run ALS adjustment (SimilarityBetween, as in your current ALSADJ default)
-            AlsAdj();
+            var doc = AcadApp.DocumentManager.MdiActiveDocument;
+            if (doc != null)
+                doc.SendStringToExecute("_.ALSADJ ", true, false, false); // queues the command
         }
-
 
         // -------- PLANLINK --------
         [CommandMethod("PLANLINK")]
@@ -915,7 +1531,6 @@ namespace SurveyCalculator
             bool useCsv = (km.Status == PromptStatus.OK && km.StringResult == "CSV");
 
             var plan = new PlanData { Closed = true, CombinedScaleFactor = 1.0 };
-
             double csf = 1.0;
 
             if (useCsv)
@@ -995,7 +1610,7 @@ namespace SurveyCalculator
 
                     // Add edge + advance
                     cur = new Point2d(cur.X + dUse * Math.Cos(az), cur.Y + dUse * Math.Sin(az));
-                    plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = az });
+                    plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = az, Locked = false });
                     plan.VertexIds.Add(toId);
                     plan.VertexXY.Add(new XY(cur.X, cur.Y));
 
@@ -1042,10 +1657,10 @@ namespace SurveyCalculator
                     double dUse = dist * csf;
 
                     string fromId = $"P{leg}";
-                    string toId   = $"P{leg + 1}";
+                    string toId = $"P{leg + 1}";
 
                     cur = new Point2d(cur.X + dUse * Math.Cos(az), cur.Y + dUse * Math.Sin(az));
-                    plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = az });
+                    plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = az, Locked = false });
                     plan.VertexIds.Add(toId);
                     plan.VertexXY.Add(new XY(cur.X, cur.Y));
 
@@ -1152,7 +1767,7 @@ namespace SurveyCalculator
                 leg++;
             }
 
-            // Ask whether to close the figure (generate computed closing leg)
+            // Ask whether to close the figure
             var closeOpt = new PromptKeywordOptions("\nClose the figure? [Yes/No] <Yes>: ");
             closeOpt.Keywords.Add("Yes");
             closeOpt.Keywords.Add("No");
@@ -1167,7 +1782,7 @@ namespace SurveyCalculator
             {
                 var c = calls[i];
                 string fromId = $"P{i + 1}";
-                string toId   = $"P{i + 2}";
+                string toId = $"P{i + 2}";
                 edges.Add((c.dist, c.azRad));
                 csvRows.Add($"{fromId},{toId},{c.btxt},{c.dtxt}");
             }
@@ -1185,7 +1800,7 @@ namespace SurveyCalculator
                 double dx = -sumX;
                 double dy = -sumY;
                 double closureDist = Math.Sqrt(dx * dx + dy * dy);
-                double closureAz   = Math.Atan2(dy, dx);
+                double closureAz = Math.Atan2(dy, dx);
                 if (closureAz < 0) closureAz += 2 * Math.PI;
 
                 edges.Add((closureDist, closureAz));
@@ -1240,7 +1855,7 @@ namespace SurveyCalculator
                     int j = (i + 1) % n;
                     double dist = Cad.Distance(verts[i], verts[j]);
                     double az = Cad.ToAzimuthRad(verts[i], verts[j]);
-                    plan.Edges.Add(new PlanEdge { FromId = plan.VertexIds[i], ToId = plan.VertexIds[j], Distance = dist, BearingRad = az });
+                    plan.Edges.Add(new PlanEdge { FromId = plan.VertexIds[i], ToId = plan.VertexIds[j], Distance = dist, BearingRad = az, Locked = false });
                 }
                 tr.Commit();
             }
@@ -1267,54 +1882,38 @@ namespace SurveyCalculator
         public void Evilink()
         {
             var ed = Cad.Ed;
-            ed.WriteMessage("\nEVILINK — select evidence blocks (no attributes needed).");
+            ed.WriteMessage("\nEVILINK — edit evidence table (assign PlanIDs / Held).");
 
-            string planPath = Config.PlanJsonPath();
-            if (!File.Exists(planPath)) { ed.WriteMessage($"\nPlan JSON not found: {planPath}\nRun PLANEXTRACT first."); return; }
-            var plan = Json.Load<PlanData>(planPath);
-            if (plan.VertexXY == null || plan.VertexXY.Count != plan.Count) { ed.WriteMessage("\nPlan JSON missing VertexXY; re-run PLANEXTRACT."); return; }
+            string evPath = Config.EvidenceJsonPath();
 
-            var tv = new TypedValue[] { new TypedValue((int)DxfCode.Start, "INSERT") };
-            var psr = Cad.PromptSelect("Select evidence blocks", tv);
-            if (psr.Status != PromptStatus.OK) return;
-
-            var links = new EvidenceLinks();
-            using (var tr = Cad.Db.TransactionManager.StartTransaction())
+            // If we already have a harvested list, open the table directly.
+            if (File.Exists(evPath))
             {
-                foreach (var id in psr.Value.GetObjectIds())
+                var links = Json.Load<EvidenceLinks>(evPath) ?? new EvidenceLinks();
+                if (links.Points.Count > 0)
                 {
-                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference; if (br == null) continue;
-                    string blockName = GetBlockName(br, tr);
-                    var evXY = new Point2d(br.Position.X, br.Position.Y);
-                    string planId = NearestPlanId(evXY, plan, Config.NearestVertexMaxMeters);
-
-                    bool strong = string.Equals(blockName, "FDI", StringComparison.OrdinalIgnoreCase);
-                    bool weak   = string.Equals(blockName, "fdspike", StringComparison.OrdinalIgnoreCase);
-                    int pri = strong ? 2 : (weak ? 0 : 1);
-                    bool heldDefault = strong;
-
-                    links.Points.Add(new EvidencePoint
-                    {
-                        PlanId = planId,
-                        Handle = br.Handle.ToString(),
-                        X = evXY.X, Y = evXY.Y,
-                        EvidenceType = blockName,
-                        Held = heldDefault,
-                        Priority = pri
-                    });
+                    if (ShowEvilinkTableAndSave(links))
+                        ed.WriteMessage($"\nSaved links: {evPath}");
+                    else
+                        ed.WriteMessage("\nCancelled (no changes saved).");
+                    return;
                 }
-                tr.Commit();
             }
 
-            var frm = new EvilinkForm(links);
+            // Otherwise guide the user to harvest first (selection window to avoid detail blocks)
+            ed.WriteMessage("\nNo evidence list found. Run EVIHARVEST first, then EVILINK.");
+        }
+
+        private bool ShowEvilinkTableAndSave(EvidenceLinks links)
+        {
+            using var frm = new EvilinkForm(links);
             var res = AcadApp.ShowModalDialog(frm);
             if (res == DialogResult.OK)
             {
-                var path = Config.EvidenceJsonPath();
-                Json.Save(path, links);
-                ed.WriteMessage($"\nSaved links: {path}");
+                Json.Save(Config.EvidenceJsonPath(), frm.Links);
+                return true;
             }
-            else ed.WriteMessage("\nCancelled (no changes saved).");
+            return false;
         }
 
         private static string GetBlockName(BlockReference br, Transaction tr)
@@ -1334,12 +1933,40 @@ namespace SurveyCalculator
             return (bestIdx >= 0 && best <= maxDist) ? plan.VertexIds[bestIdx] : "";
         }
 
+        // -------- PLANLOCK (toggle a leg's Locked flag) --------
+        [CommandMethod("PLANLOCK")]
+        public void PlanLockToggle()
+        {
+            var ed = Cad.Ed;
+            string planPath = Config.PlanJsonPath();
+            if (!File.Exists(planPath)) { ed.WriteMessage($"\nMissing: {planPath}."); return; }
+
+            var plan = Json.Load<PlanData>(planPath);
+            if (plan.Edges.Count == 0) { ed.WriteMessage("\nNo legs."); return; }
+
+            var opt = new PromptIntegerOptions($"\nLeg # to toggle lock (1..{plan.Edges.Count}): ")
+            {
+                AllowNone = false,
+                LowerLimit = 1,
+                UpperLimit = plan.Edges.Count
+            };
+            var res = ed.GetInteger(opt);
+            if (res.Status != PromptStatus.OK) return;
+
+            int idx = res.Value - 1;
+            plan.Edges[idx].Locked = !plan.Edges[idx].Locked;
+            Json.Save(planPath, plan);
+
+            var e = plan.Edges[idx];
+            ed.WriteMessage($"\nLeg {res.Value} {e.FromId}->{e.ToId} is now {(e.Locked ? "LOCKED (fixed length)" : "unlocked")}.");
+        }
+
         // -------- ALSADJ --------
         [CommandMethod("ALSADJ")]
         public void AlsAdj()
         {
             var ed = Cad.Ed;
-            ed.WriteMessage("\nALSADJ — hold anchors, re-drive between anchors by plan numbers (Similarity only).");
+            ed.WriteMessage("\nALSADJ — hold anchors, re-drive between anchors; preserves Locked leg lengths.");
 
             // Load plan
             string planPath = Config.PlanJsonPath();
@@ -1350,7 +1977,12 @@ namespace SurveyCalculator
             // Load evidence
             string evPath = Config.EvidenceJsonPath();
             if (!File.Exists(evPath)) { ed.WriteMessage($"\nMissing: {evPath}. Run EVILINK."); return; }
-            var links = Json.Load<EvidenceLinks>(evPath);
+            var links = Json.Load<EvidenceLinks>(evPath) ?? new EvidenceLinks();
+
+            // Keep evidence aligned with current drawing state (handles grid/ground scaling)
+            Cad.RefreshEvidencePositionsFromDwg(links);
+            try { Json.Save(evPath, links); } catch { /* non-fatal */ }
+
             var held = links.Points.Where(p => p.Held && !string.IsNullOrWhiteSpace(p.PlanId)).ToList();
             if (held.Count < 2) { ed.WriteMessage("\nNeed at least two Held evidence points."); return; }
 
@@ -1364,12 +1996,16 @@ namespace SurveyCalculator
 
             foreach (var hp in held)
             {
-                if (!idToIndex.TryGetValue(hp.PlanId, out int idx)) { ed.WriteMessage($"\nHeld PlanID {hp.PlanId} not in plan; skipping."); continue; }
+                if (!idToIndex.TryGetValue(hp.PlanId, out int idx))
+                {
+                    ed.WriteMessage($"\nHeld PlanID {hp.PlanId} not in plan; skipping.");
+                    continue;
+                }
                 pairs.Add((synth[idx], hp.XY(), 1.0));
             }
             if (pairs.Count < 2) { ed.WriteMessage("\nInsufficient valid Held pairs."); return; }
 
-            // Free-scale; then ALSGuard decision
+            // Free-scale; then ALSGuard decision (for reporting)
             if (!SimilarityFit.Solve(pairs, false, out double kf, out double cf, out double sf, out Vector2d tf))
             { ed.WriteMessage("\nCould not solve similarity transform from Held pairs."); return; }
             var (k, c, s, t, usedScale) = DecideScalingALS(pairs, kf, cf, sf, tf, ed);
@@ -1397,7 +2033,7 @@ namespace SurveyCalculator
 
             int n = plan.Count;
 
-            // 1) Segments BETWEEN adjacent held anchors (SimilarityBetween)
+            // 1) Segments BETWEEN adjacent held anchors (locked-aware)
             for (int hIdx = 0; hIdx < heldIdx.Count - 1; hIdx++)
             {
                 int start = heldIdx[hIdx];
@@ -1409,18 +2045,28 @@ namespace SurveyCalculator
                 var startXY = adj[start];
                 var endXY = adj[end];
 
-                var drove = TwoPointSimilarityBetween(startXY, endXY, chain);
+                List<Point2d> drove;
+                try
+                {
+                    drove = TwoPointBetweenRespectLocks(startXY, endXY, chain);
+                }
+                catch (System.Exception ex)
+                {
+                    ed.WriteMessage($"\nSegment {plan.VertexIds[start]}→{plan.VertexIds[end]} cannot satisfy Locked constraint: {ex.Message}");
+                    ed.WriteMessage("\nALSADJ aborted. (Release a lock or add another anchor across the locked span.)");
+                    return;
+                }
 
                 int kidx = 0;
-                var segTag = SolveTag.SimilarityBetween;
+                var segTag = chain.Any(e => e.Locked) ? SolveTag.SimilarityBetweenLocked : SolveTag.SimilarityBetween;
                 for (int j = start; j < end; j++) { adj[j] = drove[kidx++]; tag[j] = segTag; }
                 adj[end] = drove[kidx]; if (!tag.ContainsKey(end)) tag[end] = segTag;
             }
 
-            // 2) If the plan is CLOSED, also do the wrap segment (last held → first held)
+            // 2) Wrap segment for CLOSED figures
             if (plan.Closed && heldIdx.Count >= 2)
             {
-                int start = heldIdx[^1];
+                int start = heldIdx[heldIdx.Count - 1];
                 int end = heldIdx[0];
 
                 var chain = new List<PlanEdge>();
@@ -1434,32 +2080,40 @@ namespace SurveyCalculator
                 var startXY = adj[start];
                 var endXY = adj[end];
 
-                var drove = TwoPointSimilarityBetween(startXY, endXY, chain);
+                List<Point2d> drove;
+                try
+                {
+                    drove = TwoPointBetweenRespectLocks(startXY, endXY, chain);
+                }
+                catch (System.Exception ex)
+                {
+                    ed.WriteMessage($"\nWrap segment {plan.VertexIds[start]}→{plan.VertexIds[end]} cannot satisfy Locked constraint: {ex.Message}");
+                    ed.WriteMessage("\nALSADJ aborted. (Release a lock or add another anchor across the locked span.)");
+                    return;
+                }
 
                 int kidx = 0; i = start;
-                var segTag = SolveTag.SimilarityBetween;
+                var segTag = chain.Any(e => e.Locked) ? SolveTag.SimilarityBetweenLocked : SolveTag.SimilarityBetween;
                 while (i != end) { adj[i] = drove[kidx++]; tag[i] = segTag; i = (i + 1) % n; }
                 adj[end] = drove[kidx]; if (!tag.ContainsKey(end)) tag[end] = segTag;
             }
 
-            // 3) OPEN tails: propagate one-way from nearest held (no closure); mark as BearingDistance
+            // 3) OPEN tails: propagate one-way from nearest held (no closure); lock has no effect with single anchor
             if (!plan.Closed && heldIdx.Count >= 1)
             {
                 int firstHeld = heldIdx[0];
-                int lastHeld = heldIdx[^1];
+                int lastHeld = heldIdx[heldIdx.Count - 1];
 
                 // Left tail (… P0 ← ... ← P[firstHeld])
                 if (firstHeld > 0)
                 {
                     var revChain = new List<PlanEdge>();
-                    // walk edges backward: i = firstHeld-1 down to 0, reverse bearing (+π)
                     for (int i2 = firstHeld - 1; i2 >= 0; i2--)
                     {
                         var e = plan.EdgeAt(i2);
-                        revChain.Add(new PlanEdge { Distance = e.Distance, BearingRad = Normalize(e.BearingRad + Math.PI) });
+                        revChain.Add(new PlanEdge { Distance = e.Distance, BearingRad = Normalize(e.BearingRad + Math.PI), Locked = e.Locked });
                     }
                     var droveLeft = TraverseSolver.DriveOpenFrom(adj[firstHeld], revChain);
-                    // droveLeft[0] is held; [1] => P[firstHeld-1], ..., last => P0
                     for (int kidx = 1; kidx < droveLeft.Count; kidx++)
                     {
                         int vi = firstHeld - kidx;
@@ -1474,7 +2128,6 @@ namespace SurveyCalculator
                     var fwdChain = new List<PlanEdge>();
                     for (int i2 = lastHeld; i2 < n - 1; i2++) fwdChain.Add(plan.EdgeAt(i2));
                     var droveRight = TraverseSolver.DriveOpenFrom(adj[lastHeld], fwdChain);
-                    // droveRight[0] is held; [1] => P[lastHeld+1], ..., last => P[n-1]
                     for (int kidx = 1; kidx < droveRight.Count; kidx++)
                     {
                         int vi = lastHeld + kidx;
@@ -1505,7 +2158,7 @@ namespace SurveyCalculator
                 if (d < Config.ResidualArrowMinLen) continue; residualCount++; DrawResidualArrow(evPt, adPt, d);
             }
 
-            // CSV (always label SimilarityBetween if no explicit tag was set)
+            // CSV (tag segments that respected locks)
             var methodById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < plan.Count; i++)
             {
@@ -1525,11 +2178,11 @@ namespace SurveyCalculator
         {
             // Raw forward from the start (no closure)
             var raw = TraverseSolver.DriveOpenFrom(startHeld, chain);
-            var pEndRaw = raw[^1];
+            var pEndRaw = raw[raw.Count - 1];
 
             // Vector from startHeld to raw end, and to true end
             var vRaw = new Vector2d(pEndRaw.X - startHeld.X, pEndRaw.Y - startHeld.Y);
-            var v    = new Vector2d(endHeld.X  - startHeld.X, endHeld.Y  - startHeld.Y);
+            var v = new Vector2d(endHeld.X - startHeld.X, endHeld.Y - startHeld.Y);
 
             // Similarity parameters: scale and rotation
             double k = v.Length / Math.Max(1e-12, vRaw.Length);
@@ -1544,6 +2197,95 @@ namespace SurveyCalculator
                 double x = k * (c * dx - s * dy) + startHeld.X;
                 double y = k * (s * dx + c * dy) + startHeld.Y;
                 outPts.Add(new Point2d(x, y));
+            }
+            return outPts;
+        }
+
+        /// <summary>
+        /// Drive a chain from startHeld to endHeld keeping Locked legs at their original lengths,
+        /// and scaling all UNLOCKED legs by one factor s. A single rotation φ is applied to all legs.
+        /// This guarantees exact closure at endHeld when solvable.
+        /// Throws InvalidOperationException if there are no variable legs and the locked-only span does not match.
+        /// </summary>
+        private static List<Point2d> TwoPointBetweenRespectLocks(Point2d startHeld, Point2d endHeld, IReadOnlyList<PlanEdge> chain)
+        {
+            // Sum vectors for locked and unlocked parts (before rotation)
+            Vector2d Vlocked = new Vector2d(0, 0);
+            Vector2d Vvar = new Vector2d(0, 0);
+
+            for (int i = 0; i < chain.Count; i++)
+            {
+                var e = chain[i];
+                double cx = Math.Cos(e.BearingRad), sy = Math.Sin(e.BearingRad);
+                var u = new Vector2d(cx, sy);
+
+                if (e.Locked) Vlocked = new Vector2d(Vlocked.X + e.Distance * u.X, Vlocked.Y + e.Distance * u.Y);
+                else Vvar = new Vector2d(Vvar.X + e.Distance * u.X, Vvar.Y + e.Distance * u.Y);
+            }
+
+            // Target vector
+            var v = new Vector2d(endHeld.X - startHeld.X, endHeld.Y - startHeld.Y);
+            double vLen = Math.Sqrt(v.X * v.X + v.Y * v.Y);
+
+            // If there are no variable legs, we can only rotate. Length must match.
+            double a = (Vvar.X * Vvar.X + Vvar.Y * Vvar.Y);
+            double s = 1.0;
+            double phi;
+
+            if (a < 1e-12)
+            {
+                double Llocked = Math.Sqrt(Vlocked.X * Vlocked.X + Vlocked.Y * Vlocked.Y);
+                if (Math.Abs(Llocked - vLen) > 1e-6)
+                    throw new InvalidOperationException("no free (unlocked) legs to absorb span difference");
+                // Just rotate locked geometry
+                double angA = Math.Atan2(Vlocked.Y, Vlocked.X);
+                double angV = Math.Atan2(v.Y, v.X);
+                phi = angV - angA;
+            }
+            else
+            {
+                // Solve |Vlocked + s*Vvar| = |v|
+                double b = 2.0 * (Vlocked.X * Vvar.X + Vlocked.Y * Vvar.Y);
+                double cc = (Vlocked.X * Vlocked.X + Vlocked.Y * Vlocked.Y) - vLen * vLen;
+
+                double disc = b * b - 4.0 * a * cc;
+                if (disc < 0) disc = 0; // clamp small negatives
+
+                double sqrtD = Math.Sqrt(disc);
+                double s1 = (-b + sqrtD) / (2.0 * a);
+                double s2 = (-b - sqrtD) / (2.0 * a);
+
+                // pick a positive root, prefer one closest to 1.0
+                double best = double.PositiveInfinity;
+                void consider(double cand)
+                {
+                    if (cand > 0)
+                    {
+                        double score = Math.Abs(cand - 1.0);
+                        if (score < best) { best = score; s = cand; }
+                    }
+                }
+                consider(s1); consider(s2);
+                if (double.IsNaN(s) || double.IsInfinity(s)) s = 1.0; // conservative fallback
+
+                // Compute rotation so the composed vector points to v
+                double Ax = Vlocked.X + s * Vvar.X;
+                double Ay = Vlocked.Y + s * Vvar.Y;
+                double angA = Math.Atan2(Ay, Ax);
+                double angV = Math.Atan2(v.Y, v.X);
+                phi = angV - angA;
+            }
+
+            // Walk the chain with (len' , bearing') = (Locked?L : s*L, Bearing+phi)
+            var outPts = new List<Point2d>(chain.Count + 1) { startHeld };
+            var p = startHeld;
+            for (int i = 0; i < chain.Count; i++)
+            {
+                var e = chain[i];
+                double len = e.Locked ? e.Distance : (e.Distance * s);
+                double th = Normalize(e.BearingRad + phi);
+                p = new Point2d(p.X + len * Math.Cos(th), p.Y + len * Math.Sin(th));
+                outPts.Add(p);
             }
             return outPts;
         }
