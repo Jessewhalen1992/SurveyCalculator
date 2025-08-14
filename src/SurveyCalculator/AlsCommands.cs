@@ -56,8 +56,36 @@ namespace SurveyCalculator
             string n = string.IsNullOrEmpty(doc?.Name) ? "Drawing" : Path.GetFileNameWithoutExtension(doc.Name);
             return string.IsNullOrEmpty(n) ? "Drawing" : n;
         }
-        public static string PlanJsonPath() => Path.Combine(CurrentDwgFolder(), $"{Stem()}_PlanGraph.json");
-        public static string EvidenceJsonPath() => Path.Combine(CurrentDwgFolder(), $"{Stem()}_EvidenceLinks.json");
+        public static string PlanJsonPath()
+        {
+            string folder = CurrentDwgFolder();
+            string primary = Path.Combine(folder, $"{Stem()}_PlanGraph.json");
+            string[] fallbacks =
+            {
+                Path.Combine(folder, "COGO_PlanGraph.json"),
+                Path.Combine(folder, "COGO.json"),
+                Path.Combine(folder, "PlanGraph.json")
+            };
+            foreach (var fb in fallbacks)
+                if (File.Exists(fb))
+                    return fb;
+            return primary;
+        }
+
+        public static string EvidenceJsonPath()
+        {
+            string folder = CurrentDwgFolder();
+            string primary = Path.Combine(folder, $"{Stem()}_EvidenceLinks.json");
+            string[] fallbacks =
+            {
+                Path.Combine(folder, "COGO_EvidenceLinks.json"),
+                Path.Combine(folder, "EvidenceLinks.json")
+            };
+            foreach (var fb in fallbacks)
+                if (File.Exists(fb))
+                    return fb;
+            return primary;
+        }
         public static string ReportCsvPath() => Path.Combine(CurrentDwgFolder(), $"{Stem()}_AdjustmentReport.csv");
     }
 
@@ -614,6 +642,7 @@ namespace SurveyCalculator
 
             // Refresh the pulldown to show the newly saved/updated name
             ReloadPlanDropdown();
+            LoadSelectedPlan();
 
             return true;
         }
@@ -653,6 +682,7 @@ namespace SurveyCalculator
 
             ReloadPlanDropdown();
             LoadSelectedPlan();
+            cboPlan.SelectedIndexChanged += (s, e) => LoadSelectedPlan();
         }
 
         private void ReloadPlanDropdown()
@@ -1431,23 +1461,6 @@ namespace SurveyCalculator
             }
             SaveAndDraw(plan, closure, tag, planName);
         }
-        [Serializable]
-        public class NamedPlan
-        {
-            public string Name = "Default";
-            public DateTime ModifiedUtc = DateTime.UtcNow;
-            public PlanData Data = new PlanData();
-        }
-
-        [Serializable]
-        public class PlanStore
-        {
-            public string ActiveName = "Default";
-            public List<NamedPlan> Plans = new List<NamedPlan>();
-
-            public NamedPlan Find(string name) =>
-                Plans.FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
-        }
         // Build a PlanData from a sequence of edges (length in metres, azimuth in radians, east-of-X axis).
         // Returns the open-closure length between the last and first vertex through the out parameter.
         public static PlanData BuildPlanFromEdges(
@@ -1499,73 +1512,6 @@ namespace SurveyCalculator
             // consider it "closed" if it actually returns to start
             plan.Closed = closureLen < 1e-6;
             return plan;
-        }
-
-        internal static class PlanIO
-        {
-            public static PlanStore LoadStore(string path)
-            {
-                if (!File.Exists(path)) return new PlanStore();
-
-                // Try new multi-plan schema
-                try
-                {
-                    var s = Json.Load<PlanStore>(path);
-                    if (s != null && s.Plans != null && s.Plans.Count > 0)
-                        return s;
-                }
-                catch { /* fall through */ }
-
-                // Fallback: legacy single PlanData file -> migrate
-                try
-                {
-                    var old = Json.Load<PlanData>(path);
-                    if (old != null)
-                    {
-                        return new PlanStore
-                        {
-                            ActiveName = "Default",
-                            Plans = new List<NamedPlan>
-                    {
-                        new NamedPlan { Name = "Default", ModifiedUtc = DateTime.UtcNow, Data = old }
-                    }
-                        };
-                    }
-                }
-                catch { /* return empty */ }
-
-                return new PlanStore();
-            }
-
-            public static void SaveStore(string path, PlanStore store) => Json.Save(path, store);
-
-            public static PlanData LoadActive(string path)
-            {
-                var store = LoadStore(path);
-                var active = store.Find(store.ActiveName) ?? store.Plans.FirstOrDefault();
-                return active?.Data ?? new PlanData();
-            }
-
-            public static void Upsert(string path, string name, PlanData plan)
-            {
-                if (string.IsNullOrWhiteSpace(name)) name = "Active";
-                var store = LoadStore(path);
-                var np = store.Find(name);
-                if (np == null)
-                    store.Plans.Add(new NamedPlan { Name = name, ModifiedUtc = DateTime.UtcNow, Data = plan });
-                else
-                {
-                    np.Data = plan;
-                    np.ModifiedUtc = DateTime.UtcNow;
-                }
-                store.ActiveName = name;
-                SaveStore(path, store);
-            }
-
-            public static IEnumerable<string> Names(string path) =>
-                LoadStore(path).Plans
-                               .OrderByDescending(p => p.ModifiedUtc)
-                               .Select(p => p.Name);
         }
 
         // Keep old signature for existing call sites
