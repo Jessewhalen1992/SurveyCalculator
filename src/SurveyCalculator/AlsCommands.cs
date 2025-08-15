@@ -103,6 +103,16 @@ namespace SurveyCalculator
             public int EvidenceNo { get; set; } = 0;    // 0 = (none), otherwise 1..N
             public bool Held { get; set; } = false;
         }
+        private class UserCogoInput
+        {
+            public int Line { get; set; }
+            public string Point1 { get; set; } = "";
+            public string Point2 { get; set; } = "";
+            public string Bearing { get; set; } = "";
+            public double? Distance { get; set; }
+            public string Azimuth { get; set; } = "";
+            public string Deflection { get; set; } = "";
+        }
         // Plan name dropdown (allows typing a new name)
         private readonly ComboBox cboPlan = new ComboBox
         {
@@ -480,6 +490,26 @@ namespace SurveyCalculator
 
         private void LoadPlanIfAny()
         {
+            string folderPath = string.Empty;
+            try { folderPath = Path.GetDirectoryName(ownerDoc.Name); }
+            catch { folderPath = string.Empty; }
+
+            if (!string.IsNullOrEmpty(folderPath))
+            {
+                string csvPath = Path.Combine(folderPath, "COGO.csv");
+                var entries = LoadUserCogoInput(csvPath);
+                if (entries.Count > 0)
+                {
+                    legs.Clear();
+                    foreach (var e in entries)
+                        legs.Add(new CogoLegRow { Bearing = e.Bearing, Distance = e.Distance ?? 0.0 });
+                    RefreshLegNumbersAndEnds();
+                    if (TryBuildPlan(out var p, out double c))
+                        PlanBuild.SaveAndDraw(p, c, tag: "COGO-Editor");
+                    return;
+                }
+            }
+
             string planPath = Config.PlanJsonPath();
             if (!File.Exists(planPath)) return;
             ApplyPlanToUI(PlanIO.LoadActive(planPath));
@@ -498,6 +528,53 @@ namespace SurveyCalculator
                 else
                     verts.Add(new VertexMapRow { VertexId = vid, EvidenceNo = 0, Held = false });
             }
+        }
+
+        private static void SaveUserCogoInput(string filePath, List<UserCogoInput> entries)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Line,Point1,Point2,Bearing,Distance,Azimuth,Deflection");
+            foreach (var e in entries)
+            {
+                sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "{0},{1},{2},{3},{4},{5},{6}",
+                    e.Line,
+                    e.Point1 ?? string.Empty,
+                    e.Point2 ?? string.Empty,
+                    e.Bearing ?? string.Empty,
+                    e.Distance.HasValue ? e.Distance.Value.ToString("0.###", CultureInfo.InvariantCulture) : string.Empty,
+                    e.Azimuth ?? string.Empty,
+                    e.Deflection ?? string.Empty));
+            }
+            File.WriteAllText(filePath, sb.ToString());
+        }
+
+        private static List<UserCogoInput> LoadUserCogoInput(string filePath)
+        {
+            var list = new List<UserCogoInput>();
+            if (!File.Exists(filePath)) return list;
+            var lines = File.ReadAllLines(filePath);
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var parts = lines[i].Split(',');
+                if (parts.Length < 7) continue;
+                double dist;
+                double? distVal = double.TryParse(parts[4], NumberStyles.Float, CultureInfo.InvariantCulture, out dist)
+                    ? (double?)dist : null;
+                int lineNo;
+                int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out lineNo);
+                list.Add(new UserCogoInput
+                {
+                    Line = lineNo,
+                    Point1 = parts[1],
+                    Point2 = parts[2],
+                    Bearing = parts[3],
+                    Distance = distVal,
+                    Azimuth = parts[5],
+                    Deflection = parts[6]
+                });
+            }
+            return list;
         }
 
         private void ConfigureLegsGrid()
@@ -627,6 +704,26 @@ namespace SurveyCalculator
             var planName = string.IsNullOrWhiteSpace(cboPlan.Text)
                 ? $"Session {DateTime.Now:yyyyMMdd_HHmm}"
                 : cboPlan.Text.Trim();
+
+            var entries = new List<UserCogoInput>();
+            for (int i = 0; i < legs.Count; i++)
+            {
+                entries.Add(new UserCogoInput
+                {
+                    Line = i + 1,
+                    Point1 = "P" + (i + 1),
+                    Point2 = "P" + (i + 2),
+                    Bearing = legs[i].Bearing,
+                    Distance = legs[i].Distance
+                });
+            }
+            try
+            {
+                string folder = Path.GetDirectoryName(ownerDoc.Name);
+                if (!string.IsNullOrEmpty(folder))
+                    SaveUserCogoInput(Path.Combine(folder, "COGO.csv"), entries);
+            }
+            catch { }
 
             PlanBuild.SaveAndDraw(plan, closure, tag: "COGO-Editor", planName: planName);
 
