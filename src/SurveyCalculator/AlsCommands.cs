@@ -1,4 +1,4 @@
-// SurveyCalculator - ALS workflow commands for AutoCAD Map 3D (.NET 8)
+// SurveyCalculator - ALS workflow commands for AutoCAD Map 3D (.NET Framework 4.8)
 // Commands: PLANLINK, PLANEXTRACT, EVILINK, ALSADJ, PLANCOGO, PLANCOGOUI, ALSWIZARD, PLANFROMTEXT, PLANLOCK, EVIHARVEST
 // Build x64; refs: acdbmgd.dll, acmgd.dll, ManagedMapApi.dll (Copy Local = false)
 // Framework refs used: System.Windows.Forms
@@ -86,6 +86,66 @@ namespace SurveyCalculator
             return primary;
         }
         public static string ReportCsvPath() => Path.Combine(CurrentDwgFolder(), $"{Stem()}_AdjustmentReport.csv");
+    }
+    internal class UserCogoInput
+    {
+        public int Line;
+        public string Point1 = "";
+        public string Point2 = "";
+        public string Bearing = "";
+        public double Distance;
+        public string Azimuth = "";
+        public string Deflection = "";
+    }
+
+    internal static class CogoFile
+    {
+        public static void SaveUserCogoInput(string filePath, List<UserCogoInput> entries)
+        {
+            using (var sw = new StreamWriter(filePath, false, Encoding.UTF8))
+            {
+                sw.WriteLine("Line,Point1,Point2,Bearing,Distance,Azimuth,Deflection");
+                foreach (var e in entries)
+                {
+                    sw.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                        "{0},{1},{2},{3},{4},{5},{6}",
+                        e.Line,
+                        e.Point1,
+                        e.Point2,
+                        e.Bearing,
+                        e.Distance,
+                        e.Azimuth ?? string.Empty,
+                        e.Deflection ?? string.Empty));
+                }
+            }
+        }
+
+        public static List<UserCogoInput> LoadUserCogoInput(string filePath)
+        {
+            var list = new List<UserCogoInput>();
+            if (!File.Exists(filePath)) return list;
+            var lines = File.ReadAllLines(filePath);
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var parts = lines[i].Split(',');
+                if (parts.Length < 7) continue;
+                double dist;
+                double.TryParse(parts[4], NumberStyles.Float, CultureInfo.InvariantCulture, out dist);
+                int lineNo;
+                int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out lineNo);
+                list.Add(new UserCogoInput
+                {
+                    Line = lineNo,
+                    Point1 = parts[1],
+                    Point2 = parts[2],
+                    Bearing = parts[3],
+                    Distance = dist,
+                    Azimuth = parts[5],
+                    Deflection = parts[6]
+                });
+            }
+            return list;
+        }
     }
 
     // ---------------------------- PLAN COGO UI (Form) ----------------------------
@@ -316,6 +376,8 @@ namespace SurveyCalculator
             // Load existing data if available
             LoadEvidence();
             LoadPlanIfAny();
+            if (legs.Count == 0)
+                LoadCogoCsvIfExists();
             WireEvidenceComboColumn();
             RebuildVertexList(preserve: false);
             UpdateSummary();
@@ -485,6 +547,25 @@ namespace SurveyCalculator
             ApplyPlanToUI(PlanIO.LoadActive(planPath));
         }
 
+        private void LoadCogoCsvIfExists()
+        {
+            try
+            {
+                string folderPath = Path.GetDirectoryName(ownerDoc?.Name);
+                if (string.IsNullOrEmpty(folderPath)) return;
+                string file = Path.Combine(folderPath, "COGO.csv");
+                var entries = CogoFile.LoadUserCogoInput(file);
+                if (entries == null || entries.Count == 0) return;
+                legs.Clear();
+                foreach (var e in entries)
+                    legs.Add(new CogoLegRow { Bearing = e.Bearing, Distance = e.Distance, Locked = false });
+            }
+            catch
+            {
+                // ignore errors
+            }
+        }
+
         private void RebuildVertexList(bool preserve)
         {
             var old = verts.ToDictionary(v => v.VertexId, v => v);
@@ -622,6 +703,26 @@ namespace SurveyCalculator
         {
             if (!TryBuildPlan(out var plan, out double closure))
                 return false;
+
+            string folderPath = Path.GetDirectoryName(ownerDoc?.Name);
+            if (!string.IsNullOrEmpty(folderPath))
+            {
+                var entries = new List<UserCogoInput>();
+                for (int i = 0; i < legs.Count; i++)
+                {
+                    entries.Add(new UserCogoInput
+                    {
+                        Line = i + 1,
+                        Point1 = "P" + (i + 1),
+                        Point2 = "P" + (i + 2),
+                        Bearing = legs[i].Bearing,
+                        Distance = legs[i].Distance,
+                        Azimuth = string.Empty,
+                        Deflection = string.Empty
+                    });
+                }
+                CogoFile.SaveUserCogoInput(Path.Combine(folderPath, "COGO.csv"), entries);
+            }
 
             // Derive a name from the dropdown (user may type a new one)
             var planName = string.IsNullOrWhiteSpace(cboPlan.Text)
@@ -873,7 +974,7 @@ namespace SurveyCalculator
             if (doc == null) return;
 
             var frm = new PlanCogoForm(doc);
-            AcadApp.ShowModelessDialog(MainWindowHandle, frm);  // .NET 8 / 2025 signature
+            AcadApp.ShowModelessDialog(frm);  // .NET 4.8 signature
         }
 
         // Wizard: Harvest → COGO UI → ALSADJ (on Save & Adjust)
@@ -888,7 +989,7 @@ namespace SurveyCalculator
             if (doc == null) return;
 
             var frm = new PlanCogoForm(doc);
-            AcadApp.ShowModelessDialog(MainWindowHandle, frm);  // .NET 8 / 2025 signature
+            AcadApp.ShowModelessDialog(frm);  // .NET 4.8 signature
             Cad.WriteMessageSafe("\nCOGO editor opened modeless. Use Save to write JSON; Save & Adjust to run ALSADJ.");
         }
     }
@@ -1809,9 +1910,6 @@ namespace SurveyCalculator
                 }
             }
         }
-        private static IntPtr MainWindowHandle
-    => Autodesk.AutoCAD.ApplicationServices.Application.MainWindow?.Handle ?? IntPtr.Zero;
-
         [CommandMethod("EVIHARVEST")]
         public void EvidenceHarvest()
         {
@@ -2236,6 +2334,26 @@ namespace SurveyCalculator
                 var kr = ed.GetKeywords(kopt);
                 plan.Closed = !(kr.Status == PromptStatus.OK && kr.StringResult == "No");
             }
+            string folderPath2 = Path.GetDirectoryName(AcadApp.DocumentManager.MdiActiveDocument?.Name);
+            if (!string.IsNullOrEmpty(folderPath2))
+            {
+                var entries2 = new List<UserCogoInput>();
+                for (int i = 0; i < plan.Edges.Count; i++)
+                {
+                    var e2 = plan.EdgeAt(i);
+                    entries2.Add(new UserCogoInput
+                    {
+                        Line = i + 1,
+                        Point1 = e2.FromId,
+                        Point2 = e2.ToId,
+                        Bearing = e2.BearingText,
+                        Distance = e2.Distance,
+                        Azimuth = string.Empty,
+                        Deflection = string.Empty
+                    });
+                }
+                CogoFile.SaveUserCogoInput(Path.Combine(folderPath2, "COGO.csv"), entries2);
+            }
 
             PlanBuild.SaveAndDraw(plan, tag: "COGO");
             Cad.WriteMessageSafe("\nNext step: EVILINK → assign Held evidence (P#) → ALSADJ.");
@@ -2346,6 +2464,28 @@ namespace SurveyCalculator
             Cad.WriteMessageSafe($"\nWrote calls CSV: {csvPath}");
 
             var pdata = PlanBuild.BuildPlanFromEdges(edges, out double closureLen);
+
+            string folderPath3 = Path.GetDirectoryName(AcadApp.DocumentManager.MdiActiveDocument?.Name);
+            if (!string.IsNullOrEmpty(folderPath3))
+            {
+                var entries3 = new List<UserCogoInput>();
+                for (int i = 0; i < edges.Count; i++)
+                {
+                    var e3 = edges[i];
+                    entries3.Add(new UserCogoInput
+                    {
+                        Line = i + 1,
+                        Point1 = "P" + (i + 1),
+                        Point2 = "P" + (i + 2),
+                        Bearing = e3.btxt,
+                        Distance = e3.L,
+                        Azimuth = string.Empty,
+                        Deflection = string.Empty
+                    });
+                }
+                CogoFile.SaveUserCogoInput(Path.Combine(folderPath3, "COGO.csv"), entries3);
+            }
+
             PlanBuild.SaveAndDraw(pdata, closureLen, "TextSelection");
 
             Cad.WriteMessageSafe("\nNext: run EVILINK, assign Held evidence to P# IDs, then ALSADJ.");
@@ -2417,7 +2557,7 @@ namespace SurveyCalculator
                 if (links.Points.Count > 0)
                 {
                     using var frm = new EvilinkForm(links);
-                    var res = AcadApp.ShowModalDialog(MainWindowHandle, frm);  // .NET 8 / 2025 signature
+                    var res = AcadApp.ShowModalDialog(frm);  // .NET 4.8 signature
                     if (res == DialogResult.OK)
                     {
                         Json.Save(evPath, frm.Links);
@@ -2437,7 +2577,7 @@ namespace SurveyCalculator
         private bool ShowEvilinkTableAndSave(EvidenceLinks links)
         {
             using var frm = new EvilinkForm(links);
-            var res = AcadApp.ShowModalDialog(MainWindowHandle, frm);
+            var res = AcadApp.ShowModalDialog(frm);
             if (res == DialogResult.OK)
             {
                 Json.Save(Config.EvidenceJsonPath(), frm.Links);
