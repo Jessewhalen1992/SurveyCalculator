@@ -1,11 +1,11 @@
 # SurveyCalculator
 
-AutoCAD Map 3D plugin seed (.NET 8, x64).
+AutoCAD Map 3D plugin seed (targets .NET 8 and .NET Framework 4.8, x64).
 
 ## Build requirements
 - Windows + Visual Studio 2022
-- .NET 8 (net8.0-windows)
-- AutoCAD 2025 (managed DLL references; Map API lives under the `\Map` subfolder)
+- .NET 8 (net8.0-windows) or .NET Framework 4.8
+- AutoCAD 2025 or Map 3D 2015 (managed DLL references; Map API lives under the `\Map` subfolder)
 
 Set your AutoCAD install path in **Directory.Build.props**:
 ```xml
