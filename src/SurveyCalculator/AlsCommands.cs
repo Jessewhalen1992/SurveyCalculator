@@ -3,7 +3,6 @@
 // Build x64; refs: acdbmgd.dll, acmgd.dll, ManagedMapApi.dll (Copy Local = false)
 // Framework refs used: System.Windows.Forms
 
-using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.Colors;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
@@ -18,9 +17,15 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Web.Script.Serialization;
 using System.Windows.Forms;
+
+#if NET8_0_OR_GREATER
+using Autodesk.AutoCAD.ApplicationServices; // Document, Editor, etc.
+using AcadApp = Autodesk.AutoCAD.ApplicationServices.Core.Application;
+#else
+using Autodesk.AutoCAD.ApplicationServices;
 using AcadApp = Autodesk.AutoCAD.ApplicationServices.Application;
+#endif
 
 [assembly: CommandClass(typeof(SurveyCalculator.Commands))]
 
@@ -1015,13 +1020,28 @@ namespace SurveyCalculator
 
     internal static class Json
     {
-        static readonly JavaScriptSerializer Jss = new JavaScriptSerializer();
+#if NET8_0_OR_GREATER
+        private static readonly System.Text.Json.JsonSerializerOptions Jso =
+            new System.Text.Json.JsonSerializerOptions
+            {
+                IncludeFields = true,   // models use fields
+                WriteIndented = false
+            };
+
+        public static void Save<T>(string path, T obj)
+            => File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(obj, Jso), Encoding.UTF8);
+
+        public static T Load<T>(string path)
+            => System.Text.Json.JsonSerializer.Deserialize<T>(File.ReadAllText(path, Encoding.UTF8), Jso);
+#else
+        static readonly System.Web.Script.Serialization.JavaScriptSerializer Jss = new System.Web.Script.Serialization.JavaScriptSerializer();
 
         public static void Save<T>(string path, T obj)
             => File.WriteAllText(path, Jss.Serialize(obj), Encoding.UTF8);
 
         public static T Load<T>(string path)
             => Jss.Deserialize<T>(File.ReadAllText(path, Encoding.UTF8));
+#endif
     }
 
     internal static class Cad
@@ -1090,57 +1110,6 @@ namespace SurveyCalculator
                 }
             });
             return wasLocked;
-        }
-
-        public static void WithLockedDoc(Action action)
-        {
-            var doc = Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
-            if (doc == null) { action(); return; }
-
-            var oldDb = HostApplicationServices.WorkingDatabase;
-            try
-            {
-                HostApplicationServices.WorkingDatabase = doc.Database;
-
-                if (doc.LockMode == DocumentLockMode.NotLocked)
-                {
-                    using (doc.LockDocument())
-                        action();
-                }
-                else
-                {
-                    action();
-                }
-            }
-            finally
-            {
-                HostApplicationServices.WorkingDatabase = oldDb;
-            }
-        }
-
-        public static void WithLockedDoc(Document doc, Action action)
-        {
-            if (doc == null) { action(); return; }
-
-            var oldDb = HostApplicationServices.WorkingDatabase;
-            try
-            {
-                HostApplicationServices.WorkingDatabase = doc.Database;
-
-                if (doc.LockMode == DocumentLockMode.NotLocked)
-                {
-                    using (doc.LockDocument())
-                        action();
-                }
-                else
-                {
-                    action();
-                }
-            }
-            finally
-            {
-                HostApplicationServices.WorkingDatabase = oldDb;
-            }
         }
 
         public static ObjectId EnsureLayer(string name, short aci = 7, bool lockAfter = false)
@@ -3192,13 +3161,12 @@ namespace SurveyCalculator
                     scale.ToString("0.000000", CultureInfo.InvariantCulture),
                     (rotRad * 180.0 / Math.PI).ToString("0.000", CultureInfo.InvariantCulture)
                 );
-
-                                if (hasMethod && methodById != null)
-                                    {
+                if (hasMethod && methodById != null)
+                {
                     string mth;
-                                        if (methodById.TryGetValue(id, out mth))
+                    if (methodById.TryGetValue(id, out mth))
                         row += "," + Csv(mth);
-                                    }
+                }
 
                 sb.AppendLine(row);
             }
