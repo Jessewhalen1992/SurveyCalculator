@@ -110,6 +110,7 @@ namespace SurveyCalculator
             DropDownStyle = ComboBoxStyle.DropDown, // user can type a new name
             Width = 320
         };
+        private readonly Button btnNewPlan = new Button { Text = "New...", Width = 70 };
 
         private class ComboItem { public int Index { get; set; } public string Label { get; set; } = ""; }
 
@@ -430,8 +431,17 @@ namespace SurveyCalculator
             double azClose = Math.Atan2(dy, dx);
             if (azClose < 0) azClose += 2 * Math.PI;
 
-            string btxt = Cad.FormatBearing(azClose);
-            legs.Add(new CogoLegRow { Bearing = btxt, Distance = dist, Locked = false });
+            // Pick style that matches the majority of existing bearings
+            bool useCompact =
+                legs.Count > 0 &&
+                legs.Count(l => BearingParserEx.LooksQuadCompact(l.Bearing)) >
+                (legs.Count / 2);
+
+            string btxt = useCompact ? Cad.FormatBearingCompact(azClose)
+                                     : Cad.FormatBearing(azClose);
+
+            // distance is already in the current input units; round to UI precision
+            legs.Add(new CogoLegRow { Bearing = btxt, Distance = Math.Round(dist, 3), Locked = false });
             RefreshLegNumbersAndEnds();
         }
 
@@ -679,6 +689,23 @@ namespace SurveyCalculator
             var planBar = new Panel { Left = 10, Top = 28, Width = 560, Height = 26, Parent = this };
             var lblPlan = new Label { Parent = planBar, Left = 0, Top = 6, AutoSize = true, Text = "Named COGO:" };
             cboPlan.Parent = planBar; cboPlan.Left = 100; cboPlan.Top = 2;
+
+            // make the dropdown friendlier
+            cboPlan.AutoCompleteMode = AutoCompleteMode.SuggestAppend;
+            cboPlan.AutoCompleteSource = AutoCompleteSource.ListItems;
+
+            // "New..." button to create a new named COGO
+            btnNewPlan.Parent = planBar;
+            btnNewPlan.Left = cboPlan.Left + cboPlan.Width + 8;
+            btnNewPlan.Top = 0;
+            btnNewPlan.Click += (s, e) =>
+            {
+                cboPlan.SelectedIndex = -1;
+                cboPlan.Text = string.Empty;
+                cboPlan.Focus();
+                MessageBox.Show("Type a new name in the box, then click Save or Save & Adjust.",
+                    "New COGO", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
 
             ReloadPlanDropdown();
             LoadSelectedPlan();
@@ -933,19 +960,22 @@ namespace SurveyCalculator
         public static bool UnlockIfLocked(string layerName)
         {
             bool wasLocked = false;
-            using var tr = Db.TransactionManager.StartTransaction();
-            var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
-            if (lt.Has(layerName))
+            WithLockedDoc(() =>
             {
-                var rec = (LayerTableRecord)tr.GetObject(lt[layerName], OpenMode.ForRead);
-                if (rec.IsLocked)
+                using var tr = Db.TransactionManager.StartTransaction();
+                var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
+                if (lt.Has(layerName))
                 {
-                    rec.UpgradeOpen();
-                    rec.IsLocked = false;
-                    wasLocked = true;
+                    var rec = (LayerTableRecord)tr.GetObject(lt[layerName], OpenMode.ForRead);
+                    if (rec.IsLocked)
+                    {
+                        rec.UpgradeOpen();
+                        rec.IsLocked = false;
+                        wasLocked = true;
+                    }
                 }
-            }
-            tr.Commit();
+                tr.Commit();
+            });
             return wasLocked;
         }
 
@@ -979,49 +1009,83 @@ namespace SurveyCalculator
 
         public static ObjectId EnsureLayer(string name, short aci = 7, bool lockAfter = false)
         {
-            ObjectId id;
-            using (var tr = Db.TransactionManager.StartTransaction())
+            ObjectId id = ObjectId.Null;
+            WithLockedDoc(() =>
             {
+                using var tr = Db.TransactionManager.StartTransaction();
                 var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
                 if (!lt.Has(name))
                 {
                     lt.UpgradeOpen();
-                    var rec = new LayerTableRecord { Name = name, Color = Color.FromColorIndex(ColorMethod.ByAci, aci) };
-                    id = lt.Add(rec); tr.AddNewlyCreatedDBObject(rec, true);
+                    var rec = new LayerTableRecord
+                    {
+                        Name = name,
+                        Color = Color.FromColorIndex(ColorMethod.ByAci, aci)
+                    };
+                    id = lt.Add(rec);
+                    tr.AddNewlyCreatedDBObject(rec, true);
                 }
-                else id = lt[name];
+                else
+                {
+                    id = lt[name];
+                }
                 tr.Commit();
-            }
-            if (lockAfter) LockLayer(name, true);
+
+                if (lockAfter) LockLayer(name, true);
+            });
             return id;
         }
+
         public static void LockLayer(string name, bool locked)
         {
-            using var tr = Db.TransactionManager.StartTransaction();
-            var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
-            if (!lt.Has(name)) return;
-            var rec = (LayerTableRecord)tr.GetObject(lt[name], OpenMode.ForRead);
-            rec.UpgradeOpen(); rec.IsLocked = locked; tr.Commit();
+            WithLockedDoc(() =>
+            {
+                using var tr = Db.TransactionManager.StartTransaction();
+                var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
+                if (!lt.Has(name)) return;
+                var rec = (LayerTableRecord)tr.GetObject(lt[name], OpenMode.ForRead);
+                rec.UpgradeOpen();
+                rec.IsLocked = locked;
+                tr.Commit();
+            });
         }
+
         public static ObjectId AddToModelSpace(Entity e)
         {
-            using var tr = Db.TransactionManager.StartTransaction();
-            var bt = (BlockTable)tr.GetObject(Db.BlockTableId, OpenMode.ForRead);
-            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
-            var id = ms.AppendEntity(e); tr.AddNewlyCreatedDBObject(e, true); tr.Commit(); return id;
+            ObjectId id = ObjectId.Null;
+            WithLockedDoc(() =>
+            {
+                using var tr = Db.TransactionManager.StartTransaction();
+                var bt = (BlockTable)tr.GetObject(Db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+                id = ms.AppendEntity(e);
+                tr.AddNewlyCreatedDBObject(e, true);
+                tr.Commit();
+            });
+            return id;
         }
+
         public static void TransformEntities(IEnumerable<ObjectId> ids, Matrix3d m)
         {
-            using var tr = Db.TransactionManager.StartTransaction();
-            foreach (var id in ids) ((Entity)tr.GetObject(id, OpenMode.ForWrite)).TransformBy(m);
-            tr.Commit();
+            WithLockedDoc(() =>
+            {
+                using var tr = Db.TransactionManager.StartTransaction();
+                foreach (var id in ids)
+                    ((Entity)tr.GetObject(id, OpenMode.ForWrite)).TransformBy(m);
+                tr.Commit();
+            });
         }
+
         public static void SetLayer(IEnumerable<ObjectId> ids, string layer)
         {
             EnsureLayer(layer);
-            using var tr = Db.TransactionManager.StartTransaction();
-            foreach (var id in ids) ((Entity)tr.GetObject(id, OpenMode.ForWrite)).Layer = layer;
-            tr.Commit();
+            WithLockedDoc(() =>
+            {
+                using var tr = Db.TransactionManager.StartTransaction();
+                foreach (var id in ids)
+                    ((Entity)tr.GetObject(id, OpenMode.ForWrite)).Layer = layer;
+                tr.Commit();
+            });
         }
         public static PromptSelectionResult PromptSelect(string msg, params TypedValue[] filter)
         {
@@ -1042,6 +1106,27 @@ namespace SurveyCalculator
         public static double ToAzimuthRad(Point2d a, Point2d b)
         {
             double th = Math.Atan2(b.Y - a.Y, b.X - a.X); if (th < 0) th += 2 * Math.PI; return th;
+        }
+        public static string FormatBearingCompact(double az)
+        {
+            az %= 2 * Math.PI; if (az < 0) az += 2 * Math.PI;
+            bool north = az <= Math.PI / 2 || az >= 3 * Math.PI / 2;
+            bool east  = az < Math.PI;
+
+            double theta = north ? (east ? az : Math.PI - az)
+                                 : (east ? 2 * Math.PI - az : az - Math.PI);
+
+            double deg = theta * 180.0 / Math.PI;
+            int d = (int)Math.Floor(deg + 1e-9);
+            double remM = (deg - d) * 60.0;
+            int m = (int)Math.Floor(remM + 1e-9);
+            double sExact = (remM - m) * 60.0;
+            int s = (int)Math.Round(sExact);
+
+            if (s == 60) { s = 0; m += 1; }
+            if (m == 60) { m = 0; d += 1; }
+
+            return $"{(north ? "N" : "S")}{d:00}.{m:00}{s:00}{(east ? "E" : "W")}";
         }
         public static string FormatBearing(double az)
         {
@@ -1208,6 +1293,12 @@ namespace SurveyCalculator
         static readonly Regex AzNumeric = new Regex(
             @"^\s*(?:AZ\s*)?([0-9]+)(?:\.([0-9]+))?\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        public static bool LooksQuadCompact(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            return QuadCompact.IsMatch(text.Trim());
+        }
 
         private static bool TryParseDegreesMmSs(string degStr, string fracStr, out double degOut)
         {
