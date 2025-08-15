@@ -1,0 +1,51 @@
+<ApplicationPackage
+  SchemaVersion="1.0"
+  Name="SurveyCalculator"
+  AppVersion="1.0"
+  ProductCode="{11111111-2222-3333-4444-555555555555}">
+  <CompanyDetails Name="Your Company" Url="https://example.com" Email="support@example.com" />
+
+  <Components>
+
+    <!-- 2015–2024: .NET Framework build -->
+    <ComponentEntry
+      AppName="SurveyCalculator (2015–2024)"
+      ModuleName="./Contents/2015/SurveyCalculator.dll"
+      LoadOnCommandInvocation="True">
+      <RuntimeRequirements OS="Win32|Win64" Platform="AutoCAD|Map" SeriesMin="R20.0" SeriesMax="R24.3" />
+      <Commands GroupName="SurveyCalculator">
+        <Command Global="PLANLINK" />
+        <Command Global="PLANEXTRACT" />
+        <Command Global="EVILINK" />
+        <Command Global="ALSADJ" />
+        <Command Global="PLANCOGO" />
+        <Command Global="PLANCOGOUI" />
+        <Command Global="ALSWIZARD" />
+        <Command Global="PLANFROMTEXT" />
+        <Command Global="PLANLOCK" />
+        <Command Global="EVIHARVEST" />
+      </Commands>
+    </ComponentEntry>
+
+    <!-- 2025+: .NET 8 build -->
+    <ComponentEntry
+      AppName="SurveyCalculator (2025+)"
+      ModuleName="./Contents/2025/SurveyCalculator.dll"
+      LoadOnCommandInvocation="True">
+      <RuntimeRequirements OS="Win64" Platform="AutoCAD|Map" SeriesMin="R25.0" />
+      <Commands GroupName="SurveyCalculator">
+        <Command Global="PLANLINK" />
+        <Command Global="PLANEXTRACT" />
+        <Command Global="EVILINK" />
+        <Command Global="ALSADJ" />
+        <Command Global="PLANCOGO" />
+        <Command Global="PLANCOGOUI" />
+        <Command Global="ALSWIZARD" />
+        <Command Global="PLANFROMTEXT" />
+        <Command Global="PLANLOCK" />
+        <Command Global="EVIHARVEST" />
+      </Commands>
+    </ComponentEntry>
+
+  </Components>
+</ApplicationPackage>

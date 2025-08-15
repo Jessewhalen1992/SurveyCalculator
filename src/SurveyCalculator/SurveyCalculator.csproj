@@ -1,50 +1,84 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net48</TargetFramework>
-    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
-    <OutputType>Library</OutputType>
+    <TargetFrameworks>net48;net8.0-windows</TargetFrameworks>
     <UseWindowsForms>true</UseWindowsForms>
-    <PlatformTarget>x64</PlatformTarget>
-    <Prefer32Bit>false</Prefer32Bit>
-    <RootNamespace>SurveyCalculator</RootNamespace>
+    <Platforms>x64</Platforms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AssemblyName>SurveyCalculator</AssemblyName>
-    <LangVersion>7.3</LangVersion>
+    <RootNamespace>SurveyCalculator</RootNamespace>
     <Nullable>disable</Nullable>
-    <Deterministic>true</Deterministic>
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
-    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
   </PropertyGroup>
 
-  <!-- Autodesk managed assemblies -->
-  <ItemGroup>
+  <!-- net48 (AutoCAD/Map 3D 2015–2024) -->
+  <PropertyGroup Condition="'$(TargetFramework)'=='net48'">
+    <DefineConstants>CAD_LEGACY</DefineConstants>
+    <LangVersion>7.3</LangVersion>
+  </PropertyGroup>
 
-    <Reference Include="accoremgd">
-      <HintPath>..\..\..\2014 dlls\accoremgd.dll</HintPath>
+  <!-- net8 (AutoCAD/Map 3D 2025+) -->
+  <PropertyGroup Condition="'$(TargetFramework)'=='net8.0-windows'">
+    <DefineConstants>CAD_NET8</DefineConstants>
+  </PropertyGroup>
+
+  <!-- References for 2015–2024 -->
+  <ItemGroup Condition="'$(TargetFramework)'=='net48'">
+    <Reference Include="acdbmgd">
+      <HintPath>$(ACAD2015)\acdbmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>$(ACAD2015)\acmgd.dll</HintPath>
+      <Private>false</Private>
     </Reference>
 
-    <Reference Include="Acdbmgd">
-      <HintPath>..\..\..\2014 dlls\acdbmgd.dll</HintPath>
+    <!-- Uncomment if you actually use Map 3D APIs in this project (Object Data, etc.) -->
+    <!--
+    <Reference Include="Autodesk.Gis.Map.Platform">
+      <HintPath>$(MAP2015)\Autodesk.Gis.Map.Platform.dll</HintPath>
+      <Private>false</Private>
     </Reference>
-
-    <Reference Include="Acmgd">
-      <HintPath>..\..\..\2014 dlls\acmgd.dll</HintPath>
+    <Reference Include="Autodesk.Gis.Map.ObjectData">
+      <HintPath>$(MAP2015)\Autodesk.Gis.Map.ObjectData.dll</HintPath>
+      <Private>false</Private>
     </Reference>
-
-    <Reference Include="ManagedMapApi">
-      <HintPath>..\..\..\..\..\..\Program Files\Autodesk\AutoCAD 2025\Map\ManagedMapApi.dll</HintPath>
-    </Reference>
-
-    <Reference Include="System" />
-    <Reference Include="System.Core" />
-    <Reference Include="System.Drawing" />
-    <Reference Include="System.Windows.Forms" />
-    <Reference Include="System.Web.Extensions" />
+    -->
   </ItemGroup>
 
-  <!-- Copy the built DLL to /deploy for easy NETLOAD -->
-  <Target Name="PostBuild" AfterTargets="Build">
-    <MakeDir Directories="$(MSBuildProjectDirectory)\..\..\deploy" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(MSBuildProjectDirectory)\..\..\deploy" />
+  <!-- References for 2025+ -->
+  <ItemGroup Condition="'$(TargetFramework)'=='net8.0-windows'">
+    <Reference Include="acdbmgd">
+      <HintPath>$(ACAD2025)\acdbmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>$(ACAD2025)\acmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="accoremgd">
+      <HintPath>$(ACAD2025)\accoremgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Map 3D 2025 consolidates Map APIs into ManagedMapApi -->
+    <Reference Include="ManagedMapApi">
+      <HintPath>$(MAP2025)\ManagedMapApi.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Copy the built DLLs into the .bundle structure -->
+  <Target Name="BundleCopy" AfterTargets="Build">
+    <PropertyGroup>
+      <BundleRoot>$(MSBuildProjectDirectory)\..\..\SurveyCalculator.bundle\Contents</BundleRoot>
+    </PropertyGroup>
+    <MakeDir Directories="$(BundleRoot)\2015;$(BundleRoot)\2025" />
+    <Copy Condition="'$(TargetFramework)'=='net48'"
+          SourceFiles="$(TargetPath)"
+          DestinationFolder="$(BundleRoot)\2015"
+          SkipUnchangedFiles="true" />
+    <Copy Condition="'$(TargetFramework)'=='net8.0-windows'"
+          SourceFiles="$(TargetPath)"
+          DestinationFolder="$(BundleRoot)\2025"
+          SkipUnchangedFiles="true" />
   </Target>
 </Project>

@@ -1,7 +1,10 @@
 <Project>
   <PropertyGroup>
-    <!-- Update if your path differs -->
-    <ACAD_DIR>C:\Program Files\Autodesk\AutoCAD 2025</ACAD_DIR>
+    <!-- Adjust these to match your actual installs -->
+    <ACAD2015>C:\Program Files\Autodesk\AutoCAD 2015</ACAD2015>
+    <MAP2015>C:\Program Files\Autodesk\Autodesk AutoCAD Map 3D 2015</MAP2015>
+
+    <ACAD2025>C:\Program Files\Autodesk\AutoCAD 2025</ACAD2025>
+    <MAP2025>C:\Program Files\Autodesk\AutoCAD Map 3D 2025</MAP2025>
   </PropertyGroup>
 </Project>
-
