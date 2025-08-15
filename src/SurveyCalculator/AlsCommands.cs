@@ -17,8 +17,8 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using AcadApp = Autodesk.AutoCAD.ApplicationServices.Application;
 
@@ -553,16 +553,25 @@ namespace SurveyCalculator
             {
                 string folderPath = Path.GetDirectoryName(ownerDoc?.Name);
                 if (string.IsNullOrEmpty(folderPath)) return;
-                string file = Path.Combine(folderPath, "COGO.csv");
+
+                // Try COGO (no extension) first, then legacy COGO.csv
+                string[] candidates = {
+                    Path.Combine(folderPath, "COGO"),
+                    Path.Combine(folderPath, "COGO.csv")
+                };
+                string file = candidates.FirstOrDefault(File.Exists);
+                if (string.IsNullOrEmpty(file)) return;
+
                 var entries = CogoFile.LoadUserCogoInput(file);
                 if (entries == null || entries.Count == 0) return;
+
                 legs.Clear();
                 foreach (var e in entries)
                     legs.Add(new CogoLegRow { Bearing = e.Bearing, Distance = e.Distance, Locked = false });
             }
             catch
             {
-                // ignore errors
+                // ignore
             }
         }
 
@@ -721,7 +730,7 @@ namespace SurveyCalculator
                         Deflection = string.Empty
                     });
                 }
-                CogoFile.SaveUserCogoInput(Path.Combine(folderPath, "COGO.csv"), entries);
+                CogoFile.SaveUserCogoInput(Path.Combine(folderPath, "COGO"), entries);
             }
 
             // Derive a name from the dropdown (user may type a new one)
@@ -996,18 +1005,13 @@ namespace SurveyCalculator
 
     internal static class Json
     {
-        static readonly JsonSerializerOptions Opt = new JsonSerializerOptions
-        {
-            WriteIndented = false,
-            PropertyNamingPolicy = null,
-            IncludeFields = true
-        };
+        static readonly JavaScriptSerializer Jss = new JavaScriptSerializer();
 
         public static void Save<T>(string path, T obj)
-            => File.WriteAllText(path, JsonSerializer.Serialize(obj, Opt), Encoding.UTF8);
+            => File.WriteAllText(path, Jss.Serialize(obj), Encoding.UTF8);
 
         public static T Load<T>(string path)
-            => JsonSerializer.Deserialize<T>(File.ReadAllText(path, Encoding.UTF8), Opt);
+            => Jss.Deserialize<T>(File.ReadAllText(path, Encoding.UTF8));
     }
 
     internal static class Cad
@@ -1025,31 +1029,33 @@ namespace SurveyCalculator
         {
             if (links?.Points == null || links.Points.Count == 0) return;
 
-            using var tr = Db.TransactionManager.StartTransaction();
-            foreach (var p in links.Points)
+            using (var tr = Db.TransactionManager.StartTransaction())
             {
-                if (string.IsNullOrWhiteSpace(p.Handle)) continue;
-
-                try
+                foreach (var p in links.Points)
                 {
-                    long hval = Convert.ToInt64(p.Handle, 16);
-                    var h = new Handle(hval);
-                    ObjectId id = Db.GetObjectId(false, h, 0);
-                    if (!id.IsNull && id.IsValid)
+                    if (string.IsNullOrWhiteSpace(p.Handle)) continue;
+
+                    try
                     {
-                        if (tr.GetObject(id, OpenMode.ForRead, false) is BlockReference br)
+                        long hval = Convert.ToInt64(p.Handle, 16);
+                        var h = new Handle(hval);
+                        ObjectId id = Db.GetObjectId(false, h, 0);
+                        if (!id.IsNull && id.IsValid)
                         {
-                            p.X = br.Position.X;
-                            p.Y = br.Position.Y;
+                            if (tr.GetObject(id, OpenMode.ForRead, false) is BlockReference br)
+                            {
+                                p.X = br.Position.X;
+                                p.Y = br.Position.Y;
+                            }
                         }
                     }
+                    catch
+                    {
+                        // Handle not found / entity erased / xref, etc.
+                    }
                 }
-                catch
-                {
-                    // Handle not found / entity erased / xref, etc.
-                }
+                tr.Commit();
             }
-            tr.Commit();
         }
 
         public static bool UnlockIfLocked(string layerName)
@@ -1057,19 +1063,21 @@ namespace SurveyCalculator
             bool wasLocked = false;
             WithLockedDoc(() =>
             {
-                using var tr = Db.TransactionManager.StartTransaction();
-                var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
-                if (lt.Has(layerName))
+                using (var tr = Db.TransactionManager.StartTransaction())
                 {
-                    var rec = (LayerTableRecord)tr.GetObject(lt[layerName], OpenMode.ForRead);
-                    if (rec.IsLocked)
+                    var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
+                    if (lt.Has(layerName))
                     {
-                        rec.UpgradeOpen();
-                        rec.IsLocked = false;
-                        wasLocked = true;
+                        var rec = (LayerTableRecord)tr.GetObject(lt[layerName], OpenMode.ForRead);
+                        if (rec.IsLocked)
+                        {
+                            rec.UpgradeOpen();
+                            rec.IsLocked = false;
+                            wasLocked = true;
+                        }
                     }
+                    tr.Commit();
                 }
-                tr.Commit();
             });
             return wasLocked;
         }
@@ -1130,26 +1138,28 @@ namespace SurveyCalculator
             ObjectId id = ObjectId.Null;
             WithLockedDoc(() =>
             {
-                using var tr = Db.TransactionManager.StartTransaction();
-                var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
-                if (!lt.Has(name))
+                using (var tr = Db.TransactionManager.StartTransaction())
                 {
-                    lt.UpgradeOpen();
-                    var rec = new LayerTableRecord
+                    var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
+                    if (!lt.Has(name))
                     {
-                        Name = name,
-                        Color = Color.FromColorIndex(ColorMethod.ByAci, aci)
-                    };
-                    id = lt.Add(rec);
-                    tr.AddNewlyCreatedDBObject(rec, true);
-                }
-                else
-                {
-                    id = lt[name];
-                }
-                tr.Commit();
+                        lt.UpgradeOpen();
+                        var rec = new LayerTableRecord
+                        {
+                            Name = name,
+                            Color = Color.FromColorIndex(ColorMethod.ByAci, aci)
+                        };
+                        id = lt.Add(rec);
+                        tr.AddNewlyCreatedDBObject(rec, true);
+                    }
+                    else
+                    {
+                        id = lt[name];
+                    }
+                    tr.Commit();
 
-                if (lockAfter) LockLayer(name, true);
+                    if (lockAfter) LockLayer(name, true);
+                }
             });
             return id;
         }
@@ -1158,13 +1168,15 @@ namespace SurveyCalculator
         {
             WithLockedDoc(() =>
             {
-                using var tr = Db.TransactionManager.StartTransaction();
-                var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
-                if (!lt.Has(name)) return;
-                var rec = (LayerTableRecord)tr.GetObject(lt[name], OpenMode.ForRead);
-                rec.UpgradeOpen();
-                rec.IsLocked = locked;
-                tr.Commit();
+                using (var tr = Db.TransactionManager.StartTransaction())
+                {
+                    var lt = (LayerTable)tr.GetObject(Db.LayerTableId, OpenMode.ForRead);
+                    if (!lt.Has(name)) return;
+                    var rec = (LayerTableRecord)tr.GetObject(lt[name], OpenMode.ForRead);
+                    rec.UpgradeOpen();
+                    rec.IsLocked = locked;
+                    tr.Commit();
+                }
             });
         }
 
@@ -1173,12 +1185,14 @@ namespace SurveyCalculator
             ObjectId id = ObjectId.Null;
             WithLockedDoc(() =>
             {
-                using var tr = Db.TransactionManager.StartTransaction();
-                var bt = (BlockTable)tr.GetObject(Db.BlockTableId, OpenMode.ForRead);
-                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
-                id = ms.AppendEntity(e);
-                tr.AddNewlyCreatedDBObject(e, true);
-                tr.Commit();
+                using (var tr = Db.TransactionManager.StartTransaction())
+                {
+                    var bt = (BlockTable)tr.GetObject(Db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+                    id = ms.AppendEntity(e);
+                    tr.AddNewlyCreatedDBObject(e, true);
+                    tr.Commit();
+                }
             });
             return id;
         }
@@ -1187,10 +1201,12 @@ namespace SurveyCalculator
         {
             WithLockedDoc(() =>
             {
-                using var tr = Db.TransactionManager.StartTransaction();
-                foreach (var id in ids)
-                    ((Entity)tr.GetObject(id, OpenMode.ForWrite)).TransformBy(m);
-                tr.Commit();
+                using (var tr = Db.TransactionManager.StartTransaction())
+                {
+                    foreach (var id in ids)
+                        ((Entity)tr.GetObject(id, OpenMode.ForWrite)).TransformBy(m);
+                    tr.Commit();
+                }
             });
         }
 
@@ -1199,10 +1215,12 @@ namespace SurveyCalculator
             EnsureLayer(layer);
             WithLockedDoc(() =>
             {
-                using var tr = Db.TransactionManager.StartTransaction();
-                foreach (var id in ids)
-                    ((Entity)tr.GetObject(id, OpenMode.ForWrite)).Layer = layer;
-                tr.Commit();
+                using (var tr = Db.TransactionManager.StartTransaction())
+                {
+                    foreach (var id in ids)
+                        ((Entity)tr.GetObject(id, OpenMode.ForWrite)).Layer = layer;
+                    tr.Commit();
+                }
             });
         }
         public static PromptSelectionResult PromptSelect(string msg, params TypedValue[] filter)
@@ -1714,8 +1732,9 @@ namespace SurveyCalculator
             }
 
             // open-closure (distance last→first)
-            double dx = plan.VertexXY[^1].X - plan.VertexXY[0].X;
-            double dy = plan.VertexXY[^1].Y - plan.VertexXY[0].Y;
+            var lastV = plan.VertexXY[plan.VertexXY.Count - 1];
+            double dx = lastV.X - plan.VertexXY[0].X;
+            double dy = lastV.Y - plan.VertexXY[0].Y;
             closureLen = Math.Sqrt(dx * dx + dy * dy);
 
             // consider it "closed" if it actually returns to start
@@ -1890,23 +1909,25 @@ namespace SurveyCalculator
                 try { File.WriteAllText(alt, contents, Encoding.UTF8); return alt; }
                 catch (IOException)
                 {
-                    using var sfd = new SaveFileDialog
+                    using (var sfd = new SaveFileDialog
                     {
                         Title = "Save Adjustment Report CSV",
                         Filter = "CSV files (*.csv)|*.csv|All files|*.*",
                         FileName = Path.GetFileName(primaryPath),
                         InitialDirectory = dir
-                    };
-                    if (sfd.ShowDialog() == DialogResult.OK)
+                    })
                     {
-                        File.WriteAllText(sfd.FileName, contents, Encoding.UTF8);
-                        return sfd.FileName;
-                    }
+                        if (sfd.ShowDialog() == DialogResult.OK)
+                        {
+                            File.WriteAllText(sfd.FileName, contents, Encoding.UTF8);
+                            return sfd.FileName;
+                        }
 
-                    string tmp = Path.Combine(Path.GetTempPath(), $"{name}_{ts}{ext}");
-                    File.WriteAllText(tmp, contents, Encoding.UTF8);
-                    Cad.WriteMessageSafe($"\nWrote report to temp: {tmp}");
-                    return tmp;
+                        string tmp = Path.Combine(Path.GetTempPath(), $"{name}_{ts}{ext}");
+                        File.WriteAllText(tmp, contents, Encoding.UTF8);
+                        Cad.WriteMessageSafe($"\nWrote report to temp: {tmp}");
+                        return tmp;
+                    }
                 }
             }
         }
@@ -2173,91 +2194,95 @@ namespace SurveyCalculator
 
             var plan = new PlanData { Closed = true, CombinedScaleFactor = 1.0 };
             double csf = 1.0;
+            var rawEntries = new List<UserCogoInput>();
 
             if (useCsv)
             {
-                using var dlg = new OpenFileDialog { Title = "Select COGO CSV", Filter = "CSV files (*.csv)|*.csv|All files|*.*", Multiselect = false };
-                if (dlg.ShowDialog() != DialogResult.OK) { Cad.WriteMessageSafe("\nCancelled."); return; }
-
-                string[] lines = File.ReadAllLines(dlg.FileName);
-                if (lines.Length == 0) { Cad.WriteMessageSafe("\nCSV is empty."); return; }
-
-                foreach (var raw in lines.Take(10))
+                using (var dlg = new OpenFileDialog { Title = "Select COGO CSV", Filter = "CSV files (*.csv)|*.csv|All files|*.*", Multiselect = false })
                 {
-                    var t = raw.Trim();
-                    if (!t.StartsWith("#", StringComparison.Ordinal)) continue;
-                    var kv = t.TrimStart('#').Trim();
-                    var parts = kv.Split('=', 2, StringSplitOptions.TrimEntries);
-                    if (parts.Length == 2 && parts[0].Equals("CSF", StringComparison.OrdinalIgnoreCase))
+                    if (dlg.ShowDialog() != DialogResult.OK) { Cad.WriteMessageSafe("\nCancelled."); return; }
+
+                    string[] lines = File.ReadAllLines(dlg.FileName);
+                    if (lines.Length == 0) { Cad.WriteMessageSafe("\nCSV is empty."); return; }
+
+                    foreach (var raw in lines.Take(10))
                     {
-                        if (double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && v > 0.5 && v < 1.5) csf = v;
+                        var t = raw.Trim();
+                        if (!t.StartsWith("#", StringComparison.Ordinal)) continue;
+                        var kv = t.TrimStart('#').Trim();
+                        var parts = kv.Split(new[] { '=' }, 2);
+                        for (int i = 0; i < parts.Length; i++) parts[i] = parts[i].Trim();
+                        if (parts.Length == 2 && parts[0].Equals("CSF", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && v > 0.5 && v < 1.5) csf = v;
+                        }
                     }
-                }
-                plan.CombinedScaleFactor = csf;
+                    plan.CombinedScaleFactor = csf;
 
-                bool applyCsf = true;
-                if (Math.Abs(csf - 1.0) > 1e-6)
-                {
-                    var k = new PromptKeywordOptions($"\nCSV header CSF={csf:0.######}. Apply to distances? [Yes/No] <Yes>: ");
-                    k.Keywords.Add("Yes"); k.Keywords.Add("No"); k.AllowNone = true;
-                    var kr = ed.GetKeywords(k);
-                    applyCsf = !(kr.Status == PromptStatus.OK && kr.StringResult == "No");
-                }
-
-                var cur = new Point2d(0, 0);
-                int autoIdx = 1;
-
-                foreach (var raw in lines)
-                {
-                    var line = raw.Trim();
-                    if (line.Length == 0 || line.StartsWith("#")) continue;
-
-                    var parts = line.Split(',').Select(s => s.Trim()).ToArray();
-
-                    string fromId = "", toId = "", btxt = "", dtxt = "";
-
-                    if (parts.Length == 4)
+                    bool applyCsf = true;
+                    if (Math.Abs(csf - 1.0) > 1e-6)
                     {
-                        fromId = parts[0]; toId = parts[1]; btxt = parts[2]; dtxt = parts[3];
-                    }
-                    else if (parts.Length == 2)
-                    {
-                        fromId = $"P{autoIdx}"; toId = $"P{autoIdx + 1}"; btxt = parts[0]; dtxt = parts[1];
-                    }
-                    else
-                    {
-                        Cad.WriteMessageSafe($"\nSkip row (need 2 or 4 columns): {line}");
-                        continue;
+                        var k = new PromptKeywordOptions($"\nCSV header CSF={csf:0.######}. Apply to distances? [Yes/No] <Yes>: ");
+                        k.Keywords.Add("Yes"); k.Keywords.Add("No"); k.AllowNone = true;
+                        var kr = ed.GetKeywords(k);
+                        applyCsf = !(kr.Status == PromptStatus.OK && kr.StringResult == "No");
                     }
 
-                    if (!BearingParserEx.TryParseToAzimuthRadWithFlags(btxt, out double az, out bool hadNegBearing))
-                    { Cad.WriteMessageSafe($"\nInvalid bearing: {btxt}"); return; }
+                    var cur = new Point2d(0, 0);
+                    int autoIdx = 1;
 
-                    if (!TryParseDistance(dtxt, out double dist) || Math.Abs(dist) <= 0)
-                    { Cad.WriteMessageSafe($"\nInvalid distance: {dtxt}"); return; }
-
-                    bool distNegative = dist < 0;
-                    if (hadNegBearing && distNegative)
-                    { Cad.WriteMessageSafe($"\nCannot use '-' on BOTH bearing and distance in: {line}"); return; }
-
-                    double localAz = az;
-                    double dAbs = Math.Abs(dist);
-                    if (distNegative) localAz = Normalize(localAz + Math.PI);
-
-                    double dUse = applyCsf ? dAbs * csf : dAbs;
-
-                    if (plan.VertexIds.Count == 0)
+                    foreach (var raw in lines)
                     {
-                        plan.VertexIds.Add(fromId);
+                        var line = raw.Trim();
+                        if (line.Length == 0 || line.StartsWith("#")) continue;
+
+                        var parts = line.Split(',').Select(s => s.Trim()).ToArray();
+
+                        string fromId = "", toId = "", btxt = "", dtxt = "";
+
+                        if (parts.Length == 4)
+                        {
+                            fromId = parts[0]; toId = parts[1]; btxt = parts[2]; dtxt = parts[3];
+                        }
+                        else if (parts.Length == 2)
+                        {
+                            fromId = $"P{autoIdx}"; toId = $"P{autoIdx + 1}"; btxt = parts[0]; dtxt = parts[1];
+                        }
+                        else
+                        {
+                            Cad.WriteMessageSafe($"\nSkip row (need 2 or 4 columns): {line}");
+                            continue;
+                        }
+
+                        if (!BearingParserEx.TryParseToAzimuthRadWithFlags(btxt, out double az, out bool hadNegBearing))
+                        { Cad.WriteMessageSafe($"\nInvalid bearing: {btxt}"); return; }
+
+                        if (!TryParseDistance(dtxt, out double dist) || Math.Abs(dist) <= 0)
+                        { Cad.WriteMessageSafe($"\nInvalid distance: {dtxt}"); return; }
+
+                        bool distNegative = dist < 0;
+                        if (hadNegBearing && distNegative)
+                        { Cad.WriteMessageSafe($"\nCannot use '-' on BOTH bearing and distance in: {line}"); return; }
+
+                        double localAz = az;
+                        double dAbs = Math.Abs(dist);
+                        if (distNegative) localAz = Normalize(localAz + Math.PI);
+
+                        double dUse = applyCsf ? dAbs * csf : dAbs;
+
+                        if (plan.VertexIds.Count == 0)
+                        {
+                            plan.VertexIds.Add(fromId);
+                            plan.VertexXY.Add(new XY(cur.X, cur.Y));
+                        }
+
+                        cur = new Point2d(cur.X + dUse * Math.Cos(localAz), cur.Y + dUse * Math.Sin(localAz));
+                        plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = localAz, Locked = false, BearingText = btxt });
+                        plan.VertexIds.Add(toId);
                         plan.VertexXY.Add(new XY(cur.X, cur.Y));
+
+                        autoIdx++;
                     }
-
-                    cur = new Point2d(cur.X + dUse * Math.Cos(localAz), cur.Y + dUse * Math.Sin(localAz));
-                    plan.Edges.Add(new PlanEdge { FromId = fromId, ToId = toId, Distance = dUse, BearingRad = localAz, Locked = false, BearingText = btxt });
-                    plan.VertexIds.Add(toId);
-                    plan.VertexXY.Add(new XY(cur.X, cur.Y));
-
-                    autoIdx++;
                 }
             }
             else
@@ -2316,6 +2341,17 @@ namespace SurveyCalculator
                         if (distNeg) { dist = -dist; az = Normalize(az + Math.PI); }
                     }
 
+                    rawEntries.Add(new UserCogoInput
+                    {
+                        Line = leg,
+                        Point1 = $"P{leg}",
+                        Point2 = $"P{leg + 1}",
+                        Bearing = btxtForSave,
+                        Distance = dist,
+                        Azimuth = string.Empty,
+                        Deflection = string.Empty
+                    });
+
                     double dUse = dist * csf;
 
                     string fromId = $"P{leg}";
@@ -2337,22 +2373,31 @@ namespace SurveyCalculator
             string folderPath2 = Path.GetDirectoryName(AcadApp.DocumentManager.MdiActiveDocument?.Name);
             if (!string.IsNullOrEmpty(folderPath2))
             {
-                var entries2 = new List<UserCogoInput>();
-                for (int i = 0; i < plan.Edges.Count; i++)
+                if (rawEntries.Count > 0)
                 {
-                    var e2 = plan.EdgeAt(i);
-                    entries2.Add(new UserCogoInput
-                    {
-                        Line = i + 1,
-                        Point1 = e2.FromId,
-                        Point2 = e2.ToId,
-                        Bearing = e2.BearingText,
-                        Distance = e2.Distance,
-                        Azimuth = string.Empty,
-                        Deflection = string.Empty
-                    });
+                    // Manual mode: save the RAW user entries
+                    CogoFile.SaveUserCogoInput(Path.Combine(folderPath2, "COGO"), rawEntries);
                 }
-                CogoFile.SaveUserCogoInput(Path.Combine(folderPath2, "COGO.csv"), entries2);
+                else
+                {
+                    // CSV mode: if no raw entries collected, save from edges (as-is)
+                    var entries2 = new List<UserCogoInput>();
+                    for (int i = 0; i < plan.Edges.Count; i++)
+                    {
+                        var e2 = plan.EdgeAt(i);
+                        entries2.Add(new UserCogoInput
+                        {
+                            Line = i + 1,
+                            Point1 = e2.FromId,
+                            Point2 = e2.ToId,
+                            Bearing = e2.BearingText,
+                            Distance = e2.Distance,
+                            Azimuth = string.Empty,
+                            Deflection = string.Empty
+                        });
+                    }
+                    CogoFile.SaveUserCogoInput(Path.Combine(folderPath2, "COGO"), entries2);
+                }
             }
 
             PlanBuild.SaveAndDraw(plan, tag: "COGO");
@@ -2361,11 +2406,13 @@ namespace SurveyCalculator
 
         private string GetTextContent(ObjectId id)
         {
-            using var tr = Cad.Db.TransactionManager.StartTransaction();
-            var obj = tr.GetObject(id, OpenMode.ForRead, false);
-            if (obj is DBText dbt) return dbt.TextString.Trim();
-            if (obj is MText mt) return mt.Contents.Trim();
-            return "";
+            using (var tr = Cad.Db.TransactionManager.StartTransaction())
+            {
+                var obj = tr.GetObject(id, OpenMode.ForRead, false);
+                if (obj is DBText dbt) return dbt.TextString.Trim();
+                if (obj is MText mt) return mt.Contents.Trim();
+                return "";
+            }
         }
 
         [CommandMethod("PLANFROMTEXT")]
@@ -2483,7 +2530,7 @@ namespace SurveyCalculator
                         Deflection = string.Empty
                     });
                 }
-                CogoFile.SaveUserCogoInput(Path.Combine(folderPath3, "COGO.csv"), entries3);
+                CogoFile.SaveUserCogoInput(Path.Combine(folderPath3, "COGO"), entries3);
             }
 
             PlanBuild.SaveAndDraw(pdata, closureLen, "TextSelection");
@@ -2556,16 +2603,18 @@ namespace SurveyCalculator
                 var links = Json.Load<EvidenceLinks>(evPath) ?? new EvidenceLinks();
                 if (links.Points.Count > 0)
                 {
-                    using var frm = new EvilinkForm(links);
-                    var res = AcadApp.ShowModalDialog(frm);  // .NET 4.8 signature
-                    if (res == DialogResult.OK)
+                    using (var frm = new EvilinkForm(links))
                     {
-                        Json.Save(evPath, frm.Links);
-                        Cad.WriteMessageSafe($"\nSaved links: {evPath}");
-                    }
-                    else
-                    {
-                        Cad.WriteMessageSafe("\nCancelled (no changes saved).");
+                        var res = AcadApp.ShowModalDialog(frm);  // .NET 4.8 signature
+                        if (res == DialogResult.OK)
+                        {
+                            Json.Save(evPath, frm.Links);
+                            Cad.WriteMessageSafe($"\nSaved links: {evPath}");
+                        }
+                        else
+                        {
+                            Cad.WriteMessageSafe("\nCancelled (no changes saved).");
+                        }
                     }
                     return;
                 }
@@ -2576,14 +2625,16 @@ namespace SurveyCalculator
 
         private bool ShowEvilinkTableAndSave(EvidenceLinks links)
         {
-            using var frm = new EvilinkForm(links);
-            var res = AcadApp.ShowModalDialog(frm);
-            if (res == DialogResult.OK)
+            using (var frm = new EvilinkForm(links))
             {
-                Json.Save(Config.EvidenceJsonPath(), frm.Links);
-                return true;
+                var res = AcadApp.ShowModalDialog(frm);
+                if (res == DialogResult.OK)
+                {
+                    Json.Save(Config.EvidenceJsonPath(), frm.Links);
+                    return true;
+                }
+                return false;
             }
-            return false;
         }
 
         private static string GetBlockName(BlockReference br, Transaction tr)
