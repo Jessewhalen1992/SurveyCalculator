@@ -3,6 +3,7 @@
     <TargetFrameworks>net48;net8.0-windows</TargetFrameworks>
     <UseWindowsForms>true</UseWindowsForms>
     <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AssemblyName>SurveyCalculator</AssemblyName>
     <RootNamespace>SurveyCalculator</RootNamespace>
@@ -30,8 +31,15 @@
       <HintPath>$(ACAD2015)\acmgd.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="accoremgd">
+      <HintPath>$(ACAD2015)\accoremgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
 
-    <!-- Uncomment if you actually use Map 3D APIs in this project (Object Data, etc.) -->
+    <!-- JavaScriptSerializer (Json fallback for net48) -->
+    <Reference Include="System.Web.Extensions" />
+
+    <!-- Uncomment only if you actually consume Map 3D 2015 APIs here -->
     <!--
     <Reference Include="Autodesk.Gis.Map.Platform">
       <HintPath>$(MAP2015)\Autodesk.Gis.Map.Platform.dll</HintPath>
@@ -59,10 +67,15 @@
       <Private>false</Private>
     </Reference>
 
-    <!-- Map 3D 2025 consolidates Map APIs into ManagedMapApi -->
+    <!-- Map 3D 2025 consolidated API -->
     <Reference Include="ManagedMapApi">
       <HintPath>$(MAP2025)\ManagedMapApi.dll</HintPath>
       <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="ManagedMapApi">
+      <HintPath>..\..\..\..\..\..\Program Files\Autodesk\AutoCAD 2025\Map\ManagedMapApi.dll</HintPath>
     </Reference>
   </ItemGroup>
 
@@ -72,13 +85,7 @@
       <BundleRoot>$(MSBuildProjectDirectory)\..\..\SurveyCalculator.bundle\Contents</BundleRoot>
     </PropertyGroup>
     <MakeDir Directories="$(BundleRoot)\2015;$(BundleRoot)\2025" />
-    <Copy Condition="'$(TargetFramework)'=='net48'"
-          SourceFiles="$(TargetPath)"
-          DestinationFolder="$(BundleRoot)\2015"
-          SkipUnchangedFiles="true" />
-    <Copy Condition="'$(TargetFramework)'=='net8.0-windows'"
-          SourceFiles="$(TargetPath)"
-          DestinationFolder="$(BundleRoot)\2025"
-          SkipUnchangedFiles="true" />
+    <Copy Condition="'$(TargetFramework)'=='net48'" SourceFiles="$(TargetPath)" DestinationFolder="$(BundleRoot)\2015" SkipUnchangedFiles="true" />
+    <Copy Condition="'$(TargetFramework)'=='net8.0-windows'" SourceFiles="$(TargetPath)" DestinationFolder="$(BundleRoot)\2025" SkipUnchangedFiles="true" />
   </Target>
 </Project>

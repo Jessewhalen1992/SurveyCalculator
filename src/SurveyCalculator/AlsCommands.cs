@@ -998,7 +998,7 @@ namespace SurveyCalculator
             if (doc == null) return;
 
             var frm = new PlanCogoForm(doc);
-            AcadApp.ShowModelessDialog(frm);  // .NET 4.8 signature
+            AcadUI.ShowModeless(frm);
         }
 
         // Wizard: Harvest → COGO UI → ALSADJ (on Save & Adjust)
@@ -1013,7 +1013,7 @@ namespace SurveyCalculator
             if (doc == null) return;
 
             var frm = new PlanCogoForm(doc);
-            AcadApp.ShowModelessDialog(frm);  // .NET 4.8 signature
+            AcadUI.ShowModeless(frm);
             Cad.WriteMessageSafe("\nCOGO editor opened modeless. Use Save to write JSON; Save & Adjust to run ALSADJ.");
         }
     }
@@ -2679,7 +2679,7 @@ namespace SurveyCalculator
                 {
                     using (var frm = new EvilinkForm(links))
                     {
-                        var res = AcadApp.ShowModalDialog(frm);  // .NET 4.8 signature
+                        var res = AcadUI.ShowModal(frm);
                         if (res == DialogResult.OK)
                         {
                             Json.Save(evPath, frm.Links);
@@ -2701,7 +2701,7 @@ namespace SurveyCalculator
         {
             using (var frm = new EvilinkForm(links))
             {
-                var res = AcadApp.ShowModalDialog(frm);
+                var res = AcadUI.ShowModal(frm);
                 if (res == DialogResult.OK)
                 {
                     Json.Save(Config.EvidenceJsonPath(), frm.Links);
@@ -3091,6 +3091,42 @@ namespace SurveyCalculator
             Cad.AddToModelSpace(new Line(new Point3d(toAdj.X, toAdj.Y, 0), new Point3d(a1.X, a1.Y, 0)) { Layer = Config.LayerResiduals, Color = color });
             Cad.AddToModelSpace(new Line(new Point3d(toAdj.X, toAdj.Y, 0), new Point3d(a2.X, a2.Y, 0)) { Layer = Config.LayerResiduals, Color = color });
         }
+
+        // Cross‑TFM UI shim for showing WinForms inside AutoCAD
+        internal static class AcadUI
+        {
+#if NET8_0_OR_GREATER
+            private sealed class AcWin32Owner : System.Windows.Forms.IWin32Window
+            {
+                public AcWin32Owner(IntPtr handle) { Handle = handle; }
+                public IntPtr Handle { get; }
+            }
+
+            /// <summary>Show a modeless form owned by AutoCAD's main window (AutoCAD 2025+ / .NET 8).</summary>
+            public static void ShowModeless(System.Windows.Forms.Form form)
+            {
+                var mw = Autodesk.AutoCAD.ApplicationServices.Core.Application.MainWindow;
+                var owner = (mw != null) ? new AcWin32Owner(mw.Handle) : null;
+                if (owner != null) form.Show(owner); else form.Show();
+            }
+
+            /// <summary>Show a modal form owned by AutoCAD's main window (AutoCAD 2025+ / .NET 8).</summary>
+            public static System.Windows.Forms.DialogResult ShowModal(System.Windows.Forms.Form form)
+            {
+                var mw = Autodesk.AutoCAD.ApplicationServices.Core.Application.MainWindow;
+                var owner = (mw != null) ? new AcWin32Owner(mw.Handle) : null;
+                return (owner != null) ? form.ShowDialog(owner) : form.ShowDialog();
+            }
+#else
+    /// <summary>Classic wrappers for .NET Framework 4.8 builds.</summary>
+    public static void ShowModeless(System.Windows.Forms.Form form)
+        => Autodesk.AutoCAD.ApplicationServices.Application.ShowModelessDialog(form);
+
+    public static System.Windows.Forms.DialogResult ShowModal(System.Windows.Forms.Form form)
+        => Autodesk.AutoCAD.ApplicationServices.Application.ShowModalDialog(form);
+#endif
+        }
+
 
         // In partial class Commands
         private static string WriteCsvReport(
