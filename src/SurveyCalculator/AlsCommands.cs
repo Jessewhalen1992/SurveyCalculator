@@ -16,7 +16,6 @@ using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Numerics;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -629,10 +628,7 @@ namespace SurveyCalculator
                 ? $"Session {DateTime.Now:yyyyMMdd_HHmm}"
                 : cboPlan.Text.Trim();
 
-            Cad.WithLockedDoc(ownerDoc, () =>
-            {
-                PlanBuild.SaveAndDraw(plan, closure, tag: "COGO-Editor", planName: planName);
-            });
+            PlanBuild.SaveAndDraw(plan, closure, tag: "COGO-Editor", planName: planName);
 
             // Persist evidence links (unchanged from your version)
             foreach (var p in links.Points) p.PlanId = "";
@@ -667,17 +663,14 @@ namespace SurveyCalculator
 
             var basePt = pr.Value;
 
-            Cad.WithLockedDoc(ownerDoc, () =>
+            Cad.EnsureLayer(Config.LayerPdf, aci: 4);
+            var pl = new Polyline { Layer = Config.LayerPdf, Closed = plan.Closed };
+            for (int i = 0; i < plan.VertexXY.Count; i++)
             {
-                Cad.EnsureLayer(Config.LayerPdf, aci: 4);
-                var pl = new Polyline { Layer = Config.LayerPdf, Closed = plan.Closed };
-                for (int i = 0; i < plan.VertexXY.Count; i++)
-                {
-                    var v = plan.VertexXY[i];
-                    pl.AddVertexAt(i, new Point2d(basePt.X + v.X, basePt.Y + v.Y), 0, 0, 0);
-                }
-                Cad.AddToModelSpace(pl);
-            });
+                var v = plan.VertexXY[i];
+                pl.AddVertexAt(i, new Point2d(basePt.X + v.X, basePt.Y + v.Y), 0, 0, 0);
+            }
+            Cad.AddToModelSpace(pl);
 
             OwnerEd.WriteMessage($"\nCOGO drawn at ({basePt.X:0.###}, {basePt.Y:0.###}). " +
                                 (chkApplyCsf.Checked ? "CSF applied." : "CSF not applied."));
@@ -688,7 +681,7 @@ namespace SurveyCalculator
             // Small bar under the doc-guard label
             var planBar = new Panel { Left = 10, Top = 28, Width = 560, Height = 26, Parent = this };
             var lblPlan = new Label { Parent = planBar, Left = 0, Top = 6, AutoSize = true, Text = "Named COGO:" };
-            cboPlan.Parent = planBar; cboPlan.Left = 100; cboPlan.Top = 2;
+            cboPlan.Parent = planBar; cboPlan.Left = 100; cboPlan.Top = 2; cboPlan.DropDownStyle = ComboBoxStyle.DropDown;
 
             // make the dropdown friendlier
             cboPlan.AutoCompleteMode = AutoCompleteMode.SuggestAppend;
@@ -696,7 +689,7 @@ namespace SurveyCalculator
 
             // "New..." button to create a new named COGO
             btnNewPlan.Parent = planBar;
-            btnNewPlan.Left = cboPlan.Left + cboPlan.Width + 8;
+            btnNewPlan.Left = cboPlan.Right + 8;
             btnNewPlan.Top = 0;
             btnNewPlan.Click += (s, e) =>
             {
@@ -706,6 +699,7 @@ namespace SurveyCalculator
                 MessageBox.Show("Type a new name in the box, then click Save or Save & Adjust.",
                     "New COGO", MessageBoxButtons.OK, MessageBoxIcon.Information);
             };
+            planBar.Resize += (s, e) => btnNewPlan.Left = cboPlan.Right + 8;
 
             ReloadPlanDropdown();
             LoadSelectedPlan();
@@ -981,29 +975,52 @@ namespace SurveyCalculator
 
         public static void WithLockedDoc(Action action)
         {
-            var doc = AcadApp.DocumentManager.MdiActiveDocument;
+            var doc = Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null) { action(); return; }
-            using (doc.LockDocument())
+
+            var oldDb = HostApplicationServices.WorkingDatabase;
+            try
             {
-                action();
+                HostApplicationServices.WorkingDatabase = doc.Database;
+
+                if (doc.LockMode == DocumentLockMode.NotLocked)
+                {
+                    using (doc.LockDocument())
+                        action();
+                }
+                else
+                {
+                    action();
+                }
+            }
+            finally
+            {
+                HostApplicationServices.WorkingDatabase = oldDb;
             }
         }
 
         public static void WithLockedDoc(Document doc, Action action)
         {
             if (doc == null) { action(); return; }
-            using (doc.LockDocument())
+
+            var oldDb = HostApplicationServices.WorkingDatabase;
+            try
             {
-                var oldDb = HostApplicationServices.WorkingDatabase;
-                try
+                HostApplicationServices.WorkingDatabase = doc.Database;
+
+                if (doc.LockMode == DocumentLockMode.NotLocked)
                 {
-                    HostApplicationServices.WorkingDatabase = doc.Database;
+                    using (doc.LockDocument())
+                        action();
+                }
+                else
+                {
                     action();
                 }
-                finally
-                {
-                    HostApplicationServices.WorkingDatabase = oldDb;
-                }
+            }
+            finally
+            {
+                HostApplicationServices.WorkingDatabase = oldDb;
             }
         }
 
@@ -1849,82 +1866,84 @@ namespace SurveyCalculator
             Cad.EnsureLayer(LabelLayer, aci: 2);
 
             int added = 0, labeled = 0;
-
-            using (var tr = Cad.Db.TransactionManager.StartTransaction())
+            Cad.WithLockedDoc(() =>
             {
-                var ms = (BlockTableRecord)tr.GetObject(
-                    ((BlockTable)tr.GetObject(Cad.Db.BlockTableId, OpenMode.ForRead))[BlockTableRecord.ModelSpace],
-                    OpenMode.ForWrite);
-
-                bool HasLabelNear(string text, Point2d p, double tol)
+                using (var tr = Cad.Db.TransactionManager.StartTransaction())
                 {
-                    double tol2 = tol * tol;
-                    foreach (ObjectId eid in ms)
+                    var ms = (BlockTableRecord)tr.GetObject(
+                        ((BlockTable)tr.GetObject(Cad.Db.BlockTableId, OpenMode.ForRead))[BlockTableRecord.ModelSpace],
+                        OpenMode.ForWrite);
+
+                    bool HasLabelNear(string text, Point2d p, double tol)
                     {
-                        if (tr.GetObject(eid, OpenMode.ForRead) is not DBText dt) continue;
-                        if (!string.Equals(dt.Layer, LabelLayer, StringComparison.OrdinalIgnoreCase)) continue;
-                        if (!string.Equals((dt.TextString ?? "").Trim(), text, StringComparison.Ordinal)) continue;
-                        var pos3 = dt.AlignmentPoint.IsEqualTo(Point3d.Origin) ? dt.Position : dt.AlignmentPoint;
-                        double dx = pos3.X - p.X, dy = pos3.Y - p.Y;
-                        if (dx * dx + dy * dy <= tol2) return true;
-                    }
-                    return false;
-                }
-
-                foreach (var id in psr.Value.GetObjectIds())
-                {
-                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
-                    if (br == null) continue;
-
-                    string bname = GetBlockName(br, tr);
-                    if (!allowed.Contains(bname)) continue;
-
-                    string h = br.Handle.ToString();
-                    if (!byHandle.TryGetValue(h, out var ep))
-                    {
-                        bool strong = string.Equals(bname, "FDI", StringComparison.OrdinalIgnoreCase);
-                        bool weak = string.Equals(bname, "fdspike", StringComparison.OrdinalIgnoreCase);
-
-                        ep = new EvidencePoint
+                        double tol2 = tol * tol;
+                        foreach (ObjectId eid in ms)
                         {
-                            PlanId = "",
-                            Handle = h,
-                            X = br.Position.X,
-                            Y = br.Position.Y,
-                            EvidenceType = bname,
-                            Held = strong,
-                            Priority = strong ? 2 : (weak ? 0 : 1)
-                        };
-                        links.Points.Add(ep);
-                        byHandle[h] = ep;
-                        added++;
+                            if (tr.GetObject(eid, OpenMode.ForRead) is not DBText dt) continue;
+                            if (!string.Equals(dt.Layer, LabelLayer, StringComparison.OrdinalIgnoreCase)) continue;
+                            if (!string.Equals((dt.TextString ?? "").Trim(), text, StringComparison.Ordinal)) continue;
+                            var pos3 = dt.AlignmentPoint.IsEqualTo(Point3d.Origin) ? dt.Position : dt.AlignmentPoint;
+                            double dx = pos3.X - p.X, dy = pos3.Y - p.Y;
+                            if (dx * dx + dy * dy <= tol2) return true;
+                        }
+                        return false;
                     }
 
-                    int num = links.Points.FindIndex(p => string.Equals(p.Handle, h, StringComparison.OrdinalIgnoreCase)) + 1;
-                    if (num <= 0) num = 1;
-
-                    var p2 = new Point2d(ep.X, ep.Y);
-                    string labelText = $"#{num}";
-                    if (!HasLabelNear(labelText, p2, tol: LabelHeight * 0.35))
+                    foreach (var id in psr.Value.GetObjectIds())
                     {
-                        var txt = new DBText
-                        {
-                            Layer = LabelLayer,
-                            TextString = labelText,
-                            Height = LabelHeight,
-                            Justify = AttachmentPoint.MiddleCenter,
-                            AlignmentPoint = new Point3d(p2.X, p2.Y, 0),
-                            Position = new Point3d(p2.X, p2.Y, 0)
-                        };
-                        ms.AppendEntity(txt);
-                        tr.AddNewlyCreatedDBObject(txt, true);
-                        txt.AdjustAlignment(Cad.Db);
-                        labeled++;
-                    }
-                }
+                        var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                        if (br == null) continue;
 
-                tr.Commit();
-            }
+                        string bname = GetBlockName(br, tr);
+                        if (!allowed.Contains(bname)) continue;
+
+                        string h = br.Handle.ToString();
+                        if (!byHandle.TryGetValue(h, out var ep))
+                        {
+                            bool strong = string.Equals(bname, "FDI", StringComparison.OrdinalIgnoreCase);
+                            bool weak = string.Equals(bname, "fdspike", StringComparison.OrdinalIgnoreCase);
+
+                            ep = new EvidencePoint
+                            {
+                                PlanId = "",
+                                Handle = h,
+                                X = br.Position.X,
+                                Y = br.Position.Y,
+                                EvidenceType = bname,
+                                Held = strong,
+                                Priority = strong ? 2 : (weak ? 0 : 1)
+                            };
+                            links.Points.Add(ep);
+                            byHandle[h] = ep;
+                            added++;
+                        }
+
+                        int num = links.Points.FindIndex(p => string.Equals(p.Handle, h, StringComparison.OrdinalIgnoreCase)) + 1;
+                        if (num <= 0) num = 1;
+
+                        var p2 = new Point2d(ep.X, ep.Y);
+                        string labelText = $"#{num}";
+                        if (!HasLabelNear(labelText, p2, tol: LabelHeight * 0.35))
+                        {
+                            var txt = new DBText
+                            {
+                                Layer = LabelLayer,
+                                TextString = labelText,
+                                Height = LabelHeight,
+                                Justify = AttachmentPoint.MiddleCenter,
+                                AlignmentPoint = new Point3d(p2.X, p2.Y, 0),
+                                Position = new Point3d(p2.X, p2.Y, 0)
+                            };
+                            ms.AppendEntity(txt);
+                            tr.AddNewlyCreatedDBObject(txt, true);
+                            txt.AdjustAlignment(Cad.Db);
+                            labeled++;
+                        }
+                    }
+
+                    tr.Commit();
+                }
+            });
 
             Json.Save(evPath, links);
             Cad.WriteMessageSafe($"\nHarvested {added} new evidence; labeled {labeled}. Saved: {evPath}\n" +
@@ -2220,25 +2239,6 @@ namespace SurveyCalculator
 
             PlanBuild.SaveAndDraw(plan, tag: "COGO");
             Cad.WriteMessageSafe("\nNext step: EVILINK → assign Held evidence (P#) → ALSADJ.");
-
-            Cad.EnsureLayer(Config.LayerPdf, aci: 4);
-            var pl = new Polyline { Layer = Config.LayerPdf, Closed = plan.Closed };
-            for (int i = 0; i < plan.VertexXY.Count; i++)
-            {
-                var v = plan.VertexXY[i];
-                pl.AddVertexAt(i, new Point2d(v.X, v.Y), 0, 0, 0);
-            }
-            Cad.AddToModelSpace(pl);
-
-            var sb = new StringBuilder();
-            sb.AppendLine("\\LPlan (COGO) Summary\\l");
-            sb.AppendLine($"Vertices: {plan.Count}");
-            sb.AppendLine($"Perimeter (numeric): {plan.Edges.Sum(e => e.Distance):0.###} m");
-            sb.AppendLine($"CSF applied: {plan.CombinedScaleFactor:0.######}");
-            var mt = new MText { Contents = sb.ToString(), Location = new Point3d(0, 0, 0), TextHeight = 2.5, Layer = Config.LayerPdf };
-            Cad.AddToModelSpace(mt);
-
-            Cad.WriteMessageSafe("\nNext step: EVILINK → assign Held evidence (P#) → ALSADJ.");
         }
 
         private string GetTextContent(ObjectId id)
@@ -2334,9 +2334,11 @@ namespace SurveyCalculator
                 double closureAz = Math.Atan2(dy, dx);
                 if (closureAz < 0) closureAz += 2 * Math.PI;
 
-                edges.Add((closureDist, closureAz, Cad.FormatBearing(closureAz)));
+                bool useCompact = calls.Count(c => BearingParserEx.LooksQuadCompact(c.btxt)) > calls.Count / 2;
+                string closTxt = useCompact ? Cad.FormatBearingCompact(closureAz) : Cad.FormatBearing(closureAz);
+                edges.Add((closureDist, closureAz, closTxt));
                 string fromLast = $"P{calls.Count + 1}";
-                csvRows.Add($"{fromLast},P1,COMPUTED,{closureDist.ToString("0.###", CultureInfo.InvariantCulture)}");
+                csvRows.Add($"{fromLast},P1,{closTxt},{closureDist.ToString("0.###", CultureInfo.InvariantCulture)}");
             }
 
             string csvPath = Path.Combine(Config.CurrentDwgFolder(), $"{Config.Stem()}_SelectedCalls.csv");
