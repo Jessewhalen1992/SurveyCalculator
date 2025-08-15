@@ -1,0 +1,10 @@
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\bin\x64\Release\net48\SurveyCalculator.dll
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\bin\x64\Release\net48\SurveyCalculator.pdb
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\bin\x64\Release\net48\ManagedMapApi.dll
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\x64\Release\net48\SurveyCalculator.csproj.AssemblyReference.cache
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\x64\Release\net48\SurveyCalculator.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\x64\Release\net48\SurveyCalculator.csproj.CoreCompileInputs.cache
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\x64\Release\net48\SurveyCalculator.sourcelink.json
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\x64\Release\net48\SurveyCa.5DEE4204.Up2Date
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\x64\Release\net48\SurveyCalculator.dll
+C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\x64\Release\net48\SurveyCalculator.pdb
