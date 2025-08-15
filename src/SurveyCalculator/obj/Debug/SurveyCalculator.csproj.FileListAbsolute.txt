@@ -24,3 +24,13 @@ C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\Debug\Sur
 C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\Debug\refint\SurveyCalculator.dll
 C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.pdb
 C:\Users\Jesse 2025\Desktop\Survey Calculator\src\SurveyCalculator\obj\Debug\ref\SurveyCalculator.dll
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.csproj.AssemblyReference.cache
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.csproj.SuggestedBindingRedirects.cache
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.dll.config
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.AssemblyInfoInputs.cache
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.AssemblyInfo.cs
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.csproj.CoreCompileInputs.cache
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.sourcelink.json
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.dll
+C:\Users\Jesse 2025\Desktop\Compass Survey Calculator\src\SurveyCalculator\obj\Debug\SurveyCalculator.pdb

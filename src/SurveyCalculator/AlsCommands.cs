@@ -608,23 +608,32 @@ namespace SurveyCalculator
             };
         }
 
-        private void DeleteSelectedLegs(object? sender, EventArgs e)
+        // In class PlanCogoForm
+        private void DeleteSelectedLegs(object sender, EventArgs e)
         {
+            // End any in-progress edit so we have the latest values/selection
             gridLegs.EndEdit();
 
             var toRemove = new HashSet<CogoLegRow>();
 
+            // Prefer full row selection
             foreach (DataGridViewRow r in gridLegs.SelectedRows)
+            {
                 if (!r.IsNewRow && r.DataBoundItem is CogoLegRow rowObj)
                     toRemove.Add(rowObj);
+            }
 
+            // If nothing yet, look at selected cells
             if (toRemove.Count == 0)
             {
                 foreach (DataGridViewCell c in gridLegs.SelectedCells)
+                {
                     if (!c.OwningRow.IsNewRow && c.OwningRow.DataBoundItem is CogoLegRow rowObj)
                         toRemove.Add(rowObj);
+                }
             }
 
+            // If still nothing, remove current row
             if (toRemove.Count == 0 &&
                 gridLegs.CurrentRow != null &&
                 !gridLegs.CurrentRow.IsNewRow &&
@@ -633,7 +642,8 @@ namespace SurveyCalculator
                 toRemove.Add(curObj);
             }
 
-            if (toRemove.Count == 0) return;
+            if (toRemove.Count == 0)
+                return;
 
             foreach (var r in toRemove)
                 legs.Remove(r);
@@ -1208,6 +1218,94 @@ namespace SurveyCalculator
                     tr.Commit();
                 }
             });
+        }
+
+        // In class Cad
+        private static DocumentLockMode GetDocLockMode(Document doc)
+        {
+            // Try a property first (legacy Framework builds)
+            try
+            {
+                var pi = doc.GetType().GetProperty("LockMode",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic);
+                if (pi != null && pi.CanRead)
+                {
+                    object val = pi.GetValue(doc, null);
+                    if (val is DocumentLockMode) return (DocumentLockMode)val;
+                }
+            }
+            catch { /* ignore */ }
+
+            // Try a parameterless method named LockMode (some newer builds)
+            try
+            {
+                var mi = doc.GetType().GetMethod("LockMode",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic,
+                    null, Type.EmptyTypes, null);
+                if (mi != null)
+                {
+                    object val = mi.Invoke(doc, null);
+                    if (val is DocumentLockMode) return (DocumentLockMode)val;
+                }
+            }
+            catch { /* ignore */ }
+
+            return DocumentLockMode.NotLocked;
+        }
+
+        public static void WithLockedDoc(Action action)
+        {
+            var doc = Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null) { action(); return; }
+
+            var oldDb = HostApplicationServices.WorkingDatabase;
+            try
+            {
+                HostApplicationServices.WorkingDatabase = doc.Database;
+
+                if (GetDocLockMode(doc) == DocumentLockMode.NotLocked)
+                {
+                    using (doc.LockDocument())
+                        action();
+                }
+                else
+                {
+                    action();
+                }
+            }
+            finally
+            {
+                HostApplicationServices.WorkingDatabase = oldDb;
+            }
+        }
+
+        public static void WithLockedDoc(Document doc, Action action)
+        {
+            if (doc == null) { action(); return; }
+
+            var oldDb = HostApplicationServices.WorkingDatabase;
+            try
+            {
+                HostApplicationServices.WorkingDatabase = doc.Database;
+
+                if (GetDocLockMode(doc) == DocumentLockMode.NotLocked)
+                {
+                    using (doc.LockDocument())
+                        action();
+                }
+                else
+                {
+                    action();
+                }
+            }
+            finally
+            {
+                HostApplicationServices.WorkingDatabase = oldDb;
+            }
         }
 
         public static void SetLayer(IEnumerable<ObjectId> ids, string layer)
@@ -1931,6 +2029,7 @@ namespace SurveyCalculator
                 }
             }
         }
+        // In partial class Commands
         [CommandMethod("EVIHARVEST")]
         public void EvidenceHarvest()
         {
@@ -1939,8 +2038,8 @@ namespace SurveyCalculator
 
             var defaultNames = new[]
             {
-                "PLI","plhub","plspike","PLIBAR","FDI","TEMP","fdhub","FDIBAR","fdspike","WITF"
-            };
+        "PLI","plhub","plspike","PLIBAR","FDI","TEMP","fdhub","FDIBAR","fdspike","WITF"
+    };
             var allowed = new HashSet<string>(defaultNames, StringComparer.OrdinalIgnoreCase);
 
             string wlPath = Path.Combine(Config.CurrentDwgFolder(), $"{Config.Stem()}_BlockWhitelist.json");
@@ -1993,14 +2092,20 @@ namespace SurveyCalculator
                         ((BlockTable)tr.GetObject(Cad.Db.BlockTableId, OpenMode.ForRead))[BlockTableRecord.ModelSpace],
                         OpenMode.ForWrite);
 
+                    // (C# 7.3 friendly) helper — no 'is not' pattern
                     bool HasLabelNear(string text, Point2d p, double tol)
                     {
                         double tol2 = tol * tol;
                         foreach (ObjectId eid in ms)
                         {
-                            if (tr.GetObject(eid, OpenMode.ForRead) is not DBText dt) continue;
+                            var obj2 = tr.GetObject(eid, OpenMode.ForRead);
+                            var dt = obj2 as DBText;
+                            if (dt == null) continue;
                             if (!string.Equals(dt.Layer, LabelLayer, StringComparison.OrdinalIgnoreCase)) continue;
-                            if (!string.Equals((dt.TextString ?? "").Trim(), text, StringComparison.Ordinal)) continue;
+
+                            string s = (dt.TextString ?? "").Trim();
+                            if (!string.Equals(s, text, StringComparison.Ordinal)) continue;
+
                             var pos3 = dt.AlignmentPoint.IsEqualTo(Point3d.Origin) ? dt.Position : dt.AlignmentPoint;
                             double dx = pos3.X - p.X, dy = pos3.Y - p.Y;
                             if (dx * dx + dy * dy <= tol2) return true;
@@ -3018,6 +3123,7 @@ namespace SurveyCalculator
             Cad.AddToModelSpace(new Line(new Point3d(toAdj.X, toAdj.Y, 0), new Point3d(a2.X, a2.Y, 0)) { Layer = Config.LayerResiduals, Color = color });
         }
 
+        // In partial class Commands
         private static string WriteCsvReport(
             PlanData plan,
             EvidenceLinks links,
@@ -3035,9 +3141,14 @@ namespace SurveyCalculator
             bool hasMethod = methodById != null && methodById.Count > 0;
             sb.AppendLine("PlanID,Held,Field_X,Field_Y,Adj_X,Adj_Y,Residual_m,EvidenceType,Seg_Distance_m,Seg_Bearing,Scale,Rotation_deg" + (hasMethod ? ",SolveMethod" : ""));
 
-            static string Csv(string s)
-                => string.IsNullOrEmpty(s) ? "" :
-                   (s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s);
+            // C# 7.3-friendly (non-static) local helper
+            string Csv(string s)
+            {
+                if (string.IsNullOrEmpty(s)) return "";
+                return (s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0)
+                    ? "\"" + s.Replace("\"", "\"\"") + "\""
+                    : s;
+            }
 
             for (int i = 0; i < plan.Count; i++)
             {
@@ -3048,7 +3159,8 @@ namespace SurveyCalculator
                 double fx = double.NaN, fy = double.NaN, resid = double.NaN;
                 string evType = "";
 
-                if (dictEv.TryGetValue(id, out var ev))
+                EvidencePoint ev;
+                if (dictEv.TryGetValue(id, out ev))
                 {
                     held = ev.Held;
                     fx = ev.X;
@@ -3081,8 +3193,12 @@ namespace SurveyCalculator
                     (rotRad * 180.0 / Math.PI).ToString("0.000", CultureInfo.InvariantCulture)
                 );
 
-                if (hasMethod && methodById.TryGetValue(id, out var mth))
-                    row += "," + Csv(mth);
+                                if (hasMethod && methodById != null)
+                                    {
+                    string mth;
+                                        if (methodById.TryGetValue(id, out mth))
+                        row += "," + Csv(mth);
+                                    }
 
                 sb.AppendLine(row);
             }
